@@ -1,0 +1,9 @@
+# Install into the genie3 conda env (keeps torch==2.7.1 intact):
+#   conda activate genie3
+#   pip install -r requirements.txt
+# SB3 is pinned <2.7 on purpose: 2.7+ requires torch>=2.8 and would clobber genie3's pin.
+numpy>=1.24
+pandas>=2.0
+gymnasium>=0.29
+stable-baselines3>=2.3,<2.7
+pytest>=7

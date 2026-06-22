@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genie3-rl-knobs"
+version = "0.1.0"
+description = "RL-over-search-knobs MVP for Genie 3 binder design (AlQuraishi Lab)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "gymnasium>=0.29",
+    # SB3 pinned <2.7 so it coexists with genie3's torch==2.7.1 (>=2.7 demands torch>=2.8).
+    "stable-baselines3>=2.3,<2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+# flat top-level packages mirroring the project-spec tree (Section 3).  NOTE: the spec's
+# `logging/` directory is named `instrumentation/` here -- a top-level `logging` package
+# would shadow Python's stdlib `logging` once on sys.path and break SB3/torch imports.
+packages = [
+    "envs", "baselines", "policy", "oracle",
+    "instrumentation", "buffer", "experiments", "tests",
+]
+py-modules = ["config"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
