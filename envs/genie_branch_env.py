@@ -212,6 +212,18 @@ class GenieBranchEnv(gym.Env):
         obs = self._make_obs(target)
         return obs, float(reward), terminated, truncated, info
 
+    def encode_levers(self, levers: dict[str, Any]) -> Optional[int]:
+        """Reverse of decode_action: map a lever dict to its action index.
+
+        Returns None if no action in the table matches (used by Stage 5 buffer replay).
+        """
+        for i, row in enumerate(self._action_table):
+            if (row.get("timestep") == levers.get("timestep") and
+                    row.get("length_delta") == levers.get("length_delta") and
+                    row.get("hotspot_mode") == levers.get("hotspot_mode")):
+                return i
+        return None
+
     def reset_round(self) -> None:
         """Clear per-target 'seen so far' history (start a fresh design round)."""
         self._best_iptm = {t: 0.0 for t in self.targets}
