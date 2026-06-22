@@ -54,12 +54,21 @@ LiveRewardModel`) to be wired later — it should *shell out* to the genie3 env,
 ```
 config.py                     paths + action-space constants (override via RLKNOBS_* env vars)
 instrumentation/              Stage-0 logger + /pscratch sweep ingester   (spec's logging/, renamed*)
-oracle/reward_oracle.py       compute_reward() + OfflineRewardModel + LiveRewardModel (stub)
-envs/genie_branch_env.py      Gym env over the levers (1- or 3-lever, data-driven)
-baselines/                    fixed_heuristic, random_policy, contextual_bandit (the real bar)
-policy/train_ppo.py           Stable-Baselines3 PPO over the discrete action space
-buffer/frontier_buffer.py     LatProtRL Alg 3 stub (INITIALIZE/TOP/UPDATE) — not wired
-experiments/                  stage1/2/3 + shared harness; writes data/experiment_logs/*
+oracle/reward_oracle.py           compute_reward() + OfflineRewardModel
+oracle/live_oracle.py             LiveRewardModel: Genie3 → ProteinMPNN → ColabFold shell-out
+envs/genie_branch_env.py          Gym env over the levers (1- or 3-lever, data-driven)
+envs/commitment_window.py         Per-target commitment window detector + intervention MDP
+baselines/                        fixed_heuristic, random_policy, contextual_bandit (the real bar)
+policy/train_ppo.py               Stable-Baselines3 PPO over the discrete action space
+policy/lora_finetune.py           LoRA adapter attachment + PPO fine-tuning loop for V1Denoiser
+buffer/frontier_buffer.py         Diffusion x_T seed cache (LatProtRL Alg 3, lever-indexed)
+experiments/compare_timestep_lever.py     4-way comparison on timestep-only action space (gate)
+experiments/compare_full_levers.py        4-way comparison on full 3-lever action space
+experiments/contrast_bhrf1_insulinr.py    Target-dependent behaviour check (BHRF1 vs InsulinR)
+experiments/validate_live_oracle.py       Sanity-check live vs offline reward agreement
+experiments/benchmark_frontier_seeding.py Cold-start vs buffer-seeded rollout comparison
+experiments/train_intervention_policy.py  Commitment window detection + intervention PPO
+experiments/finetune_genie3_lora.py       LoRA fine-tuning of V1Denoiser (GPU, genie3 env)
 external/genie3               local checkout (symlink*); external/latprotrl_ref (reference)
 tests/                        env shapes, compute_reward, bandit-learns-optimum, ingest parsing
 ```
@@ -89,12 +98,18 @@ python -m instrumentation.trajectory_logger      # Stage 0: build data/records.j
 #   add --coverage to also compute hotspot contact fractions from PDBs (slower)
 python -m pytest -q                               # tests
 
-python -m experiments.stage1_timestep_only        # gate: PPO vs bandit (1-D)
-python -m experiments.stage2_full_levers          # full 3-lever space
-python -m experiments.stage3_target_contrast      # target-dependent behaviour check
+python -m experiments.compare_timestep_lever       # gate: PPO vs bandit (1-D)
+python -m experiments.compare_full_levers          # full 3-lever space
+python -m experiments.contrast_bhrf1_insulinr      # target-dependent behaviour check
+
+# Stages 4-7 (GPU node, genie3 conda env):
+python -m experiments.validate_live_oracle         # sanity-check live oracle pipeline
+python -m experiments.benchmark_frontier_seeding   # cold vs buffer-seeded (offline)
+python -m experiments.train_intervention_policy    # commitment windows + intervention PPO
+python -m experiments.finetune_genie3_lora         # LoRA fine-tuning (GPU required)
 ```
 
-Results land in `data/experiment_logs/<stage>/{summary.json,episodes.jsonl}` and are
+Results land in `data/experiment_logs/<name>/{summary.json,episodes.jsonl}` and are
 summarised in [`experiments/RESULTS.md`](experiments/RESULTS.md).
 
 ## What's still open (do not pre-decide in code)
