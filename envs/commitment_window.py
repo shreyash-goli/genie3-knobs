@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
+import gymnasium as gym
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ _N_INTERVENTION_ACTIONS = len(INTERVENTION_SCALES)
 # DiffusionInterventionEnv
 # ---------------------------------------------------------------------------
 
-class DiffusionInterventionEnv:
+class DiffusionInterventionEnv(gym.Env):
     """Stage 6 MDP: intervene on conditioning strength at the per-target commitment window.
 
     This environment MUST run inside the genie3 conda env (it imports genie3 directly).
@@ -186,12 +187,7 @@ class DiffusionInterventionEnv:
         n_children: int = 5,
         seed: Optional[int] = None,
     ):
-        try:
-            import gymnasium as gym
-            self._gym = gym
-        except ImportError:
-            raise ImportError("gymnasium is required: pip install gymnasium")
-
+        super().__init__()
         self.config_yaml = config_yaml
         self.oracle_mode = oracle_mode
         self.n_children = n_children
@@ -210,10 +206,10 @@ class DiffusionInterventionEnv:
         n_targets = len(self.targets)
         obs_dim = n_targets + self._N_CONTEXT
 
-        self.observation_space = self._gym.spaces.Box(
+        self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
-        self.action_space = self._gym.spaces.Discrete(_N_INTERVENTION_ACTIONS)
+        self.action_space = gym.spaces.Discrete(_N_INTERVENTION_ACTIONS)
 
         # episode state
         self._current_target: Optional[str] = None
