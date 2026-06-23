@@ -82,6 +82,15 @@ tests/                        env shapes, compute_reward, bandit-learns-optimum,
 
 ## Environment
 
+**NERSC GPU node setup** — before running any live oracle experiment, fix the cuDNN mismatch
+(jaxlib 0.6.2 requires cuDNN 9.8.0 but the conda env ships 9.5.1):
+```bash
+pip install "nvidia-cudnn-cu12==9.8.0.87"
+```
+Torch pins 9.5.1 in its metadata but the two runtimes (PyTorch for Genie3, JAX for ColabFold)
+don't share cuDNN at runtime so this is safe. Re-run on each new interactive session — pip
+installs are not persisted across salloc allocations if your home is network-mounted read-only.
+
 Use the **`genie3` conda env**. SB3 is pinned `<2.7` so it coexists with genie3's
 `torch==2.7.1` (SB3 ≥2.7 demands `torch>=2.8` and would clobber that pin).
 
