@@ -96,6 +96,7 @@ HOTSPOT_MODE_SUFFIX = {
 # --------------------------------------------------------------------------------------
 STAGE3_LENGTH_HELPED = "01_bhrf1"
 STAGE3_LENGTH_DID_NOT_HELP = "06_insulinr"
+STAGE3_TARGETS = (STAGE3_LENGTH_HELPED, STAGE3_LENGTH_DID_NOT_HELP)
 
 
 def ensure_data_dirs() -> None:
