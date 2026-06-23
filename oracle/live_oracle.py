@@ -47,8 +47,22 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _conda_run(cmd: list[str], env_name: str, cwd: Path, timeout: int = 900) -> str:
-    """Run ``cmd`` inside a conda environment, capturing stdout+stderr."""
-    full_cmd = ["conda", "run", "--no-capture-output", "-n", env_name] + cmd
+    """Run ``cmd``, preferring the current Python if already in the target env.
+
+    On NERSC compute nodes ``conda`` is not on PATH inside a job, and wrapping
+    with ``conda run`` would fail.  If the active Python interpreter lives inside
+    the target conda env we replace ``python`` with sys.executable and drop the
+    ``conda run`` wrapper entirely.  Falls back to ``conda run`` when running from
+    a different env (e.g. a login node test).
+    """
+    import sys
+    active_env = os.environ.get("CONDA_DEFAULT_ENV", "")
+    if active_env == env_name or env_name in sys.executable:
+        # already in the right env — replace bare "python" with sys.executable
+        resolved = [sys.executable if c == "python" else c for c in cmd]
+        full_cmd = resolved
+    else:
+        full_cmd = ["conda", "run", "--no-capture-output", "-n", env_name] + cmd
     log.debug("live_oracle shell: %s", " ".join(full_cmd))
     result = subprocess.run(
         full_cmd,
@@ -106,8 +120,16 @@ def _parse_child_metrics(branch_dir: Path) -> list[dict[str, Any]]:
     return results
 
 
-def _aggregate_children(children: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate per-child metrics into a single metrics dict (best-child-by-iptm)."""
+def _aggregate_children(
+    children: list[dict[str, Any]],
+    mean_pairwise_rmsd: Optional[float] = None,
+) -> dict[str, Any]:
+    """Aggregate per-child metrics into a single metrics dict (best-child-by-iptm).
+
+    mean_pairwise_rmsd: Cα RMSD across children from metadata.json — used as the
+    diversity proxy (normalised to [0, 1] over a 10Å scale). Pass None if unavailable;
+    diversity will be 0.0 rather than silently wrong.
+    """
     valid = [c for c in children if c.get("iptm") is not None and "error" not in c]
     if not valid:
         return {
@@ -119,16 +141,15 @@ def _aggregate_children(children: list[dict[str, Any]]) -> dict[str, Any]:
         }
     best = max(valid, key=lambda c: c.get("iptm", 0.0))
     n_success = sum(1 for c in valid if c.get("complex_success"))
-    # diversity proxy: fraction of children that are "different" from best
-    # (mean_pairwise_rmsd normalised, capped at 1)
-    rmsd = best.get("mean_pairwise_rmsd", 0.0) or 0.0
+    # diversity: mean pairwise Cα RMSD across children, normalised to [0, 1] over 10Å
+    rmsd = mean_pairwise_rmsd or 0.0
     diversity = min(1.0, rmsd / 10.0)
     return {
         "complex_success": best.get("complex_success", False),
         "iptm": best.get("iptm", 0.0),
         "avg_interface_pae": best.get("avg_interface_pae", 30.0),
         "min_interface_pae": best.get("min_interface_pae", 30.0),
-        "hotspot_coverage": best.get("hotspot_coverage", 0.0),
+        "hotspot_coverage": None,  # not computed by eval.py; requires contact analysis
         "diversity": diversity,
         "n_children": len(valid),
         "n_success": n_success,
@@ -235,7 +256,16 @@ class LiveRewardModel:
 
             # Step 3: parse and aggregate
             children = _parse_child_metrics(branch_dir)
-            metrics = _aggregate_children(children)
+            # read mean_pairwise_rmsd from metadata.json (written by trajectory_branching.py)
+            mean_rmsd = None
+            metadata_path = branch_dir / "metadata.json"
+            if metadata_path.exists():
+                try:
+                    meta = json.loads(metadata_path.read_text())
+                    mean_rmsd = meta.get("mean_pairwise_rmsd")
+                except Exception:
+                    pass
+            metrics = _aggregate_children(children, mean_pairwise_rmsd=mean_rmsd)
             metrics["target"] = target
             metrics["branch_timestep"] = timestep
             metrics["hotspot_mode"] = hotspot_mode
