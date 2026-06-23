@@ -69,13 +69,19 @@ def main():
     config_yaml = genie3_root / "branching" / "configs" / "experiment_trajectory_branching.yaml"
 
     # --- Step 1: load V1Denoiser ---
+    # genie3 config YAMLs use relative paths (pretrained/v1/config.yaml etc.)
+    # that are relative to the genie3 repo root — cd there before loading.
     log.info("Loading V1Denoiser from checkpoint...")
+    _orig_dir = os.getcwd()
+    os.chdir(str(genie3_root))
     run_config = load_experiment_config(str(config_yaml))
     generation_config = to_generation_config(run_config, shard_id=0, num_shards=1)
     sample_config = build_sample_config_from_dict(generation_config)
+    # resolve all relative paths to absolute while still inside genie3_root
+    checkpoint_path = str((genie3_root / sample_config.base.checkpoint).resolve())
+    os.chdir(_orig_dir)
 
     model = get_model(sample_config.model.model)
-    checkpoint_path = sample_config.base.checkpoint
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint["state_dict"]
 
@@ -100,21 +106,25 @@ def main():
     detector = CommitmentWindowDetector()
     windows = detector.detect(records)
 
+    # restrict to contrast targets for the proof-of-concept run (26 oracle calls ~2h)
+    poc_targets = list(config.STAGE3_TARGETS)
+    poc_windows = {t: windows[t] for t in poc_targets if t in windows}
+
     buf = FrontierBuffer(size=64, epsilon=0.1, temperature=1.0, p_frontier=0.5, seed=0)
-    buf.initialize(targets=list(windows.keys()) or config.STAGE3_TARGETS)
+    buf.initialize(targets=poc_targets)
 
     env = DiffusionInterventionEnv(
         config_yaml=str(config_yaml),
-        targets=list(windows.keys()) or config.STAGE3_TARGETS,
-        commitment_windows=windows,
+        targets=poc_targets,
+        commitment_windows=poc_windows,
         frontier_buffer=buf,
         oracle_mode="live",
     )
 
-    # --- Step 4: pre-LoRA baseline (frozen model, no adapter) ---
-    log.info("Evaluating pre-LoRA baseline (10 episodes)...")
+    # --- Step 4: pre-LoRA baseline (3 episodes for quick proof-of-concept) ---
+    log.info("Evaluating pre-LoRA baseline (3 episodes)...")
     pre_rewards = []
-    for i in range(10):
+    for i in range(3):
         obs, info = env.reset(seed=i)
         action = env.action_space.sample()  # random baseline
         _, reward, _, _, _ = env.step(action)
@@ -127,11 +137,12 @@ def main():
     actor_critic = ActorCritic.build(obs_dim=obs_dim, n_actions=env.n_actions, hidden=(64, 64))
 
     ppo_cfg = PPOFinetuneConfig(
-        total_episodes=500,
-        ppo_update_freq=32,
+        total_episodes=20,      # proof-of-concept; increase to 500 for full training
+        ppo_update_freq=10,     # update every 10 episodes at this scale
         n_epochs=4,
         batch_size=8,
         learning_rate=1e-4,
+        save_every=10,
         save_dir=str(config.EXPERIMENTS_LOG_DIR / "genie3_lora" / "checkpoints"),
     )
 
@@ -139,12 +150,12 @@ def main():
     train_log = train_lora_ppo(env, actor_critic, ppo_cfg, verbose=True)
     log.info("Training complete. mean_reward=%.4f", train_log["mean_reward"])
 
-    # --- Step 6: post-LoRA evaluation ---
-    log.info("Evaluating post-LoRA policy (10 episodes)...")
+    # --- Step 6: post-LoRA evaluation (3 episodes, matching pre-LoRA baseline) ---
+    log.info("Evaluating post-LoRA policy (3 episodes)...")
     post_rewards = []
     import numpy as np
     import torch as _torch
-    for i in range(10):
+    for i in range(3):
         obs, _ = env.reset(seed=i + 500)
         obs_t = _torch.tensor(obs, dtype=_torch.float32).unsqueeze(0)
         with _torch.no_grad():
