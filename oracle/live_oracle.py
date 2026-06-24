@@ -120,9 +120,44 @@ def _parse_child_metrics(branch_dir: Path) -> list[dict[str, Any]]:
     return results
 
 
+def _gravy(seq: str) -> float:
+    """Grand Average of Hydropathicity (Kyte-Doolittle). Higher = more hydrophobic."""
+    kd = {
+        "A": 1.8, "R": -4.5, "N": -3.5, "D": -3.5, "C": 2.5, "Q": -3.5,
+        "E": -3.5, "G": -0.4, "H": -3.2, "I": 4.5, "L": 3.8, "K": -3.9,
+        "M": 1.9, "F": 2.8, "P": -1.6, "S": -0.8, "T": -0.7, "W": -0.9,
+        "Y": -1.3, "V": 4.2,
+    }
+    scores = [kd[aa] for aa in seq.upper() if aa in kd]
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _net_charge_ph7(seq: str) -> float:
+    """Approximate net charge at pH 7 (positive = basic, negative = acidic)."""
+    seq = seq.upper()
+    positive = seq.count("K") + seq.count("R") + 0.1 * seq.count("H")
+    negative = seq.count("D") + seq.count("E")
+    return positive - negative
+
+
+# Developability thresholds for binder sequences.
+# GRAVY > 0 means net hydrophobic — aggregation-prone; most good binders sit in [-1, 0].
+# |net_charge| > 10 predicts off-target electrostatic stickiness.
+_GRAVY_MAX = 0.0
+_NET_CHARGE_ABS_MAX = 10.0
+
+
+def _passes_developability(seq: str) -> tuple[bool, float, float]:
+    """Return (passes, gravy, net_charge). Fails if GRAVY > 0 or |charge| > 10."""
+    g = _gravy(seq)
+    c = _net_charge_ph7(seq)
+    return (g <= _GRAVY_MAX and abs(c) <= _NET_CHARGE_ABS_MAX), g, c
+
+
 def _aggregate_children(
     children: list[dict[str, Any]],
     mean_pairwise_rmsd: Optional[float] = None,
+    x_T: Optional[list] = None,
 ) -> dict[str, Any]:
     """Aggregate per-child metrics into a single metrics dict (best-child-by-iptm).
 
@@ -138,12 +173,49 @@ def _aggregate_children(
             "avg_interface_pae": 30.0,
             "hotspot_coverage": 0.0,
             "diversity": 0.0,
+            "x_T": None,
         }
+
+    # Pre-ColabFold developability filter: discard sequences that are net-hydrophobic
+    # (GRAVY > 0) or carry extreme charge (|net_charge| > 10). These fail basic
+    # developability screens and would waste downstream wet-lab effort.
+    # If all children fail, fall back to unfiltered pool so the env always returns
+    # a signal (policy still penalised via low ipTM/pAE).
+    n_before = len(valid)
+    developable = [
+        c for c in valid
+        if c.get("binder_seq") is None
+        or _passes_developability(c["binder_seq"])[0]
+    ]
+    if developable:
+        valid = developable
+        log.debug("Developability filter: %d/%d children passed", len(valid), n_before)
+    else:
+        log.warning(
+            "All %d children failed developability filter (GRAVY/charge); "
+            "using unfiltered pool — reward will be low",
+            n_before,
+        )
+
     best = max(valid, key=lambda c: c.get("iptm", 0.0))
     n_success = sum(1 for c in valid if c.get("complex_success"))
     # diversity: mean pairwise Cα RMSD across children, normalised to [0, 1] over 10Å
     rmsd = mean_pairwise_rmsd or 0.0
     diversity = min(1.0, rmsd / 10.0)
+    # x_T: the frozen diffusion state (branch point noise), serialized as nested list
+    # from trajectory_branching.py. Convert to numpy array for FrontierBuffer.
+    x_T_np = None
+    if x_T is not None:
+        try:
+            import numpy as np
+            x_T_np = np.array(x_T, dtype=np.float32)
+        except Exception:
+            pass
+    binder_seq = best.get("binder_seq")
+    gravy, net_charge = (None, None)
+    if binder_seq:
+        _, gravy, net_charge = _passes_developability(binder_seq)
+
     return {
         "complex_success": best.get("complex_success", False),
         "iptm": best.get("iptm", 0.0),
@@ -153,7 +225,10 @@ def _aggregate_children(
         "diversity": diversity,
         "n_children": len(valid),
         "n_success": n_success,
-        "binder_seq": best.get("binder_seq"),
+        "binder_seq": binder_seq,
+        "gravy": gravy,
+        "net_charge": net_charge,
+        "x_T": x_T_np,
     }
 
 
@@ -256,16 +331,18 @@ class LiveRewardModel:
 
             # Step 3: parse and aggregate
             children = _parse_child_metrics(branch_dir)
-            # read mean_pairwise_rmsd from metadata.json (written by trajectory_branching.py)
+            # read mean_pairwise_rmsd and x_T from metadata.json
             mean_rmsd = None
+            x_T = None
             metadata_path = branch_dir / "metadata.json"
             if metadata_path.exists():
                 try:
                     meta = json.loads(metadata_path.read_text())
                     mean_rmsd = meta.get("mean_pairwise_rmsd")
+                    x_T = meta.get("x_T")  # nested list [N_atoms, 3] or None
                 except Exception:
                     pass
-            metrics = _aggregate_children(children, mean_pairwise_rmsd=mean_rmsd)
+            metrics = _aggregate_children(children, mean_pairwise_rmsd=mean_rmsd, x_T=x_T)
             metrics["target"] = target
             metrics["branch_timestep"] = timestep
             metrics["hotspot_mode"] = hotspot_mode
@@ -297,8 +374,14 @@ class LiveRewardModel:
 
     def _run_branching(self, out_dir: Path, timestep: int, selection: str,
                        num_children: int) -> None:
+        # Use our own wrapper (oracle/branching_wrapper.py) rather than calling
+        # genie3's trajectory_branching.py directly. The wrapper imports TrajectoryBrancher
+        # in-process, monkey-patches _denoise_to_branch_point to capture xl_frozen, and
+        # writes x_T into metadata.json — all without touching genie3's source.
+        import sys as _sys
+        repo_root = Path(__file__).resolve().parent.parent
         cmd = [
-            "python", "branching/scripts/trajectory_branching.py",
+            _sys.executable, str(repo_root / "oracle" / "branching_wrapper.py"),
             "--config", str(self.config_yaml),
             "--timestep", str(timestep),
             "--num-children", str(num_children),
