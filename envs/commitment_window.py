@@ -1,4 +1,4 @@
-"""Stage 6 — Per-target commitment window detector.
+"""Windowed MDP — per-step hotspot selection across the diffusion commitment window.
 
 The commitment window is the range of diffusion timesteps during which structural
 decisions lock in (identity of key contacts, hotspot engagement).  Stage 1 results
@@ -13,29 +13,27 @@ CommitmentWindowDetector
     the branch point is still before commitment (diffusion still deciding); low
     variance = structure has locked in (branching doesn't help anymore).
 
-    The window start is estimated as the earliest timestep where variance starts to
-    drop significantly; the window end is where it falls below a noise floor.
-
 DiffusionInterventionEnv
-    Wraps the Genie3 TrajectoryBrancher (in-process, imports genie3 directly — this
-    env MUST run inside the genie3 conda env) to implement the Stage 6 MDP:
+    A 10-step MDP over the commitment window.  At each step the policy picks a
+    hotspot mode; the episode terminates after N_WINDOW_STEPS steps and emits a
+    single sparse terminal reward.
 
-        State  S_t : noisy structure at diffusion timestep t (SE(3) frames, as a
-                     flattened observation: target one-hot + structural summary statistics
-                     + [t/T, best_iptm, exploration_frac])
-        Action A_t : discrete intervention choice at the commitment window:
-                     (no-op | perturb conditioning scale | pick hotspot subset)
-                     Currently: {no-op, scale+0.5, scale+1.0, scale+2.0, scale_off}
-        Reward     : sparse terminal, same compute_reward() as Stage 0-3
-        Episode    : one full diffusion trajectory per episode
+    State  S_t : target one-hot + [step_progress, t_norm, length_delta_norm,
+                 best_iptm, best_neg_ipae]
+    Action A_t : Discrete(3) — index into HOTSPOT_MODES
+    Reward     : 0 for steps 0..N-2; compute_reward(metrics) at step N-1 (terminal)
+    Length     : sampled once at reset() from LENGTH_DELTAS; fixed for the episode
 
-    The intervention is applied by modifying the ``direction_scale`` parameter
-    (conditioning strength) passed to the sampler at the commitment timestep.
-    This is the "conditioning embedding perturbation" from the original plan —
-    it nudges how strongly the model follows the hotspot conditioning motif.
+    In offline mode each step is a cheap oracle lookup (no GPU); in live mode each
+    step maps to one branch point within the commitment window, not one full oracle
+    call per step — the full ColabFold eval only runs at the final step.
 
-    For the LoRA fine-tuning path (Stage 7), DiffusionInterventionEnv exposes
-    the intermediate x_T state so the FrontierBuffer can cache it.
+Design rationale:
+    Making hotspot mode a per-step decision over 10 diffusion timesteps gives PPO a
+    genuine short-horizon credit-assignment problem to exploit.  Without this the env
+    is a one-shot bandit and PPO adds overhead without signal.
+    Stopping rule: if sparse-terminal proves too sample-inefficient (no learning
+    signal in the first 200 episodes), add iCS as a per-step intermediate reward.
 """
 
 from __future__ import annotations
@@ -48,6 +46,19 @@ import numpy as np
 import gymnasium as gym
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Action / lever constants
+# ---------------------------------------------------------------------------
+
+HOTSPOT_MODES: tuple[str, ...] = ("all", "ablate_competitors", "missed_only")
+LENGTH_DELTAS: tuple[int, ...] = (0, 60)
+N_WINDOW_STEPS: int = 10
+
+# Default commitment window bounds used when per-target data is unavailable.
+_DEFAULT_WINDOW_START: int = 700
+_DEFAULT_WINDOW_END: int = 950
 
 
 # ---------------------------------------------------------------------------
@@ -84,19 +95,9 @@ class CommitmentWindowDetector:
         self.min_n = min_n
 
     def detect(self, records: list[dict[str, Any]]) -> dict[str, CommitmentWindow]:
-        """Compute commitment windows for all targets in the offline dataset.
-
-        Parameters
-        ----------
-        records : list of TrajectoryRecord dicts (from load_records())
-
-        Returns
-        -------
-        dict mapping target → CommitmentWindow
-        """
+        """Compute commitment windows for all targets in the offline dataset."""
         from oracle.reward_oracle import compute_reward
 
-        # group rewards by (target, timestep)
         by_target_ts: dict[str, dict[int, list[float]]] = {}
         for r in records:
             t = r.get("target")
@@ -140,46 +141,41 @@ class CommitmentWindowDetector:
 
 
 # ---------------------------------------------------------------------------
-# Conditioning scale intervention values (the discrete action space for Stage 6)
+# DiffusionInterventionEnv — windowed MDP
 # ---------------------------------------------------------------------------
 
-# direction_scale controls how strongly the DDIM sampler follows hotspot conditioning.
-# 0.0 = unconditional; 1.0 = standard; higher = stronger conditioning (may overfit).
-INTERVENTION_SCALES = (0.0, 0.5, 1.0, 2.0, 4.0)
-_N_INTERVENTION_ACTIONS = len(INTERVENTION_SCALES)
+def _timestep_schedule(window_start: int, window_end: int, n: int) -> list[int]:
+    """Return n uniformly-spaced integer timesteps in [window_start, window_end]."""
+    if n == 1:
+        return [window_start]
+    step = (window_end - window_start) / (n - 1)
+    return [int(round(window_start + i * step)) for i in range(n)]
 
-
-# ---------------------------------------------------------------------------
-# DiffusionInterventionEnv
-# ---------------------------------------------------------------------------
 
 class DiffusionInterventionEnv(gym.Env):
-    """Stage 6 MDP: intervene on conditioning strength at the per-target commitment window.
+    """Windowed MDP: 10 per-step hotspot decisions across the diffusion commitment window.
 
-    This environment MUST run inside the genie3 conda env (it imports genie3 directly).
-    For offline/test use, set oracle_mode="offline" to use the OfflineRewardModel instead
-    of actually running diffusion.
+    Action space  : Discrete(3) — index into HOTSPOT_MODES
+    Observation   : target one-hot + [step_progress, t_norm, length_delta_norm,
+                    best_iptm, best_neg_ipae]  (all float32)
+    Reward        : 0 at steps 0..N-2; sparse terminal at step N-1
 
     Parameters
     ----------
-    config_yaml     : path to genie3 experiment YAML
-    targets         : list of target names to train on
-    commitment_windows : per-target CommitmentWindow objects (from detector above)
-    frontier_buffer : FrontierBuffer instance (for x_T seed caching and seeding)
-    oracle_mode     : "live" (runs genie3 subprocess) or "offline" (uses logged data)
-    n_children      : number of children per episode when in live mode
-    seed            : random seed
+    targets            : list of target names to train on
+    commitment_windows : per-target CommitmentWindow (from CommitmentWindowDetector)
+    frontier_buffer    : FrontierBuffer instance for x_T seed caching (optional)
+    oracle_mode        : "offline" (uses OfflineRewardModel) or "live" (runs genie3)
+    n_children         : children per oracle call when oracle_mode="live"
+    seed               : random seed
     """
 
     metadata = {"render_modes": []}
 
-    # observation layout: target one-hot (n_targets) + [t_norm, best_iptm, neg_ipae_norm,
-    #                      exploration_frac, direction_scale_norm]
-    _N_CONTEXT = 5
+    _N_CONTEXT = 5  # step_progress, t_norm, length_delta_norm, best_iptm, best_neg_ipae
 
     def __init__(
         self,
-        config_yaml: Optional[str] = None,
         targets: Optional[list[str]] = None,
         commitment_windows: Optional[dict[str, CommitmentWindow]] = None,
         frontier_buffer: Optional[Any] = None,
@@ -188,13 +184,11 @@ class DiffusionInterventionEnv(gym.Env):
         seed: Optional[int] = None,
     ):
         super().__init__()
-        self.config_yaml = config_yaml
         self.oracle_mode = oracle_mode
         self.n_children = n_children
         self.frontier_buffer = frontier_buffer
         self._rng = np.random.default_rng(seed)
 
-        # resolve targets
         if targets is not None:
             self.targets = targets
         else:
@@ -209,24 +203,25 @@ class DiffusionInterventionEnv(gym.Env):
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
-        self.action_space = gym.spaces.Discrete(_N_INTERVENTION_ACTIONS)
+        self.action_space = gym.spaces.Discrete(len(HOTSPOT_MODES))
 
         # episode state
         self._current_target: Optional[str] = None
+        self._current_length_delta: int = 0
+        self._timestep_sched: list[int] = []
         self._step_count: int = 0
         self._best_iptm: float = 0.0
         self._best_neg_ipae: float = 0.0
 
-        # offline oracle for offline mode
         if oracle_mode == "offline":
             from oracle.reward_oracle import OfflineRewardModel
-            self._offline_oracle = OfflineRewardModel()
+            self._oracle = OfflineRewardModel()
         else:
-            self._offline_oracle = None
+            self._oracle = None  # live oracle constructed lazily per-call
 
         log.info(
-            "DiffusionInterventionEnv: mode=%s  targets=%s  |A|=%d",
-            oracle_mode, self.targets, _N_INTERVENTION_ACTIONS,
+            "DiffusionInterventionEnv: mode=%s  targets=%s  |A|=%d  steps=%d",
+            oracle_mode, self.targets, len(HOTSPOT_MODES), N_WINDOW_STEPS,
         )
 
     # -- gymnasium API -------------------------------------------------------
@@ -240,97 +235,140 @@ class DiffusionInterventionEnv(gym.Env):
             self._rng = np.random.default_rng(seed)
 
         options = options or {}
-        if "target" in options:
-            self._current_target = options["target"]
-        else:
-            self._current_target = self._rng.choice(self.targets)
+        self._current_target = options.get("target") or str(
+            self._rng.choice(self.targets)
+        )
+        self._current_length_delta = int(
+            options.get("length_delta", self._rng.choice(LENGTH_DELTAS))
+        )
+
+        cw = self.commitment_windows.get(self._current_target)
+        ws = cw.window_start if cw is not None else _DEFAULT_WINDOW_START
+        we = cw.window_end if cw is not None else _DEFAULT_WINDOW_END
+        self._timestep_sched = _timestep_schedule(ws, we, N_WINDOW_STEPS)
 
         self._step_count = 0
         self._best_iptm = 0.0
         self._best_neg_ipae = 0.0
-        obs = self._make_obs(direction_scale=1.0)
-        return obs, {"target": self._current_target}
+
+        obs = self._make_obs()
+        return obs, {
+            "target": self._current_target,
+            "length_delta": self._current_length_delta,
+            "timestep_schedule": self._timestep_sched,
+        }
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
-        """Apply the chosen conditioning scale at the commitment window and run generation."""
         assert self._current_target is not None, "call reset() before step()"
-        direction_scale = INTERVENTION_SCALES[int(action)]
+        assert 0 <= int(action) < len(HOTSPOT_MODES), f"invalid action {action}"
+
+        hotspot_mode = HOTSPOT_MODES[int(action)]
+        timestep = self._timestep_sched[self._step_count]
         target = self._current_target
-        self._step_count += 1
+        length_delta = self._current_length_delta
 
-        # get commitment timestep for this target (fall back to 800 if unknown)
-        cw = self.commitment_windows.get(target)
-        branch_ts = cw.peak_variance_ts if cw is not None else 800
+        metrics, backoff = self._query_oracle(target, timestep, hotspot_mode, length_delta)
 
-        # run oracle
-        if self.oracle_mode == "offline":
-            metrics, backoff = self._offline_oracle.sample(
-                target=target,
-                timestep=branch_ts,
-                hotspot_mode="all",
-                length_delta=0,
-            )
-        else:
-            metrics, backoff = self._run_live(target, branch_ts, direction_scale)
-
-        # update running bests
         iptm = metrics.get("iptm") or 0.0
         ipae = metrics.get("avg_interface_pae") or 30.0
         self._best_iptm = max(self._best_iptm, iptm)
         self._best_neg_ipae = max(self._best_neg_ipae, 1.0 - ipae / 30.0)
 
-        from oracle.reward_oracle import compute_reward
-        reward = compute_reward(metrics)
+        self._step_count += 1
+        terminated = self._step_count >= N_WINDOW_STEPS
 
-        # cache x_T in frontier buffer if provided and live mode
-        x_T = metrics.get("_x_T")
-        if x_T is not None and self.frontier_buffer is not None:
-            from buffer.frontier_buffer import FrontierEntry
-            entry = FrontierEntry(
-                x_T=np.array(x_T, dtype=np.float32),
+        if terminated:
+            from oracle.reward_oracle import compute_reward
+            reward = float(compute_reward(metrics))
+            self._maybe_cache_x_T(metrics, target, timestep, hotspot_mode,
+                                  length_delta, reward)
+        else:
+            reward = 0.0
+
+        obs = self._make_obs()
+        info = dict(
+            metrics,
+            action=int(action),
+            hotspot_mode=hotspot_mode,
+            timestep=timestep,
+            length_delta=length_delta,
+            backoff=backoff,
+            step=self._step_count,
+        )
+        return obs, reward, terminated, False, info
+
+    # -- internal helpers ----------------------------------------------------
+
+    def _query_oracle(
+        self, target: str, timestep: int, hotspot_mode: str, length_delta: int
+    ) -> tuple[dict[str, Any], int]:
+        if self.oracle_mode == "offline":
+            return self._oracle.sample(
                 target=target,
-                levers={"timestep": branch_ts, "hotspot_mode": "all",
-                        "length_delta": 0, "direction_scale": direction_scale},
-                reward=reward,
-                metrics=metrics,
+                timestep=timestep,
+                hotspot_mode=hotspot_mode,
+                length_delta=length_delta,
             )
-            self.frontier_buffer.update(entry)
+        # live mode: shell out to genie3
+        from oracle.live_oracle import LiveRewardModel
+        oracle = LiveRewardModel()
+        return oracle.sample(
+            target=target,
+            timestep=timestep,
+            hotspot_mode=hotspot_mode,
+            length_delta=length_delta,
+        )
 
-        obs = self._make_obs(direction_scale=direction_scale)
-        info = dict(metrics, action=action, direction_scale=direction_scale,
-                    branch_ts=branch_ts, backoff=backoff)
-        return obs, reward, True, False, info  # one-step episode
-
-    def _make_obs(self, direction_scale: float) -> np.ndarray:
+    def _make_obs(self) -> np.ndarray:
         n_targets = len(self.targets)
         one_hot = np.zeros(n_targets, dtype=np.float32)
         if self._current_target is not None:
             one_hot[self._target_to_idx[self._current_target]] = 1.0
+
+        step_progress = self._step_count / N_WINDOW_STEPS
+        if self._timestep_sched:
+            t_norm = self._timestep_sched[min(self._step_count, N_WINDOW_STEPS - 1)] / 1000.0
+        else:
+            t_norm = 0.0
+        length_delta_norm = float(self._current_length_delta) / max(LENGTH_DELTAS)
+
         context = np.array([
-            1.0,  # bias
+            step_progress,
+            t_norm,
+            length_delta_norm,
             self._best_iptm,
             self._best_neg_ipae,
-            min(1.0, self._step_count / 50.0),  # exploration fraction
-            direction_scale / max(INTERVENTION_SCALES),  # normalised scale
         ], dtype=np.float32)
         return np.concatenate([one_hot, context])
 
-    def _run_live(self, target: str, branch_ts: int, direction_scale: float
-                  ) -> tuple[dict, int]:
-        """Run live oracle (genie3 subprocess) with the chosen direction_scale."""
-        from oracle.live_oracle import LiveRewardModel
-        oracle = LiveRewardModel()
-        metrics, backoff = oracle.sample(
-            target=target,
-            timestep=branch_ts,
-            hotspot_mode="all",
-            length_delta=0,
-        )
-        return metrics, backoff
+    def _maybe_cache_x_T(
+        self,
+        metrics: dict[str, Any],
+        target: str,
+        timestep: int,
+        hotspot_mode: str,
+        length_delta: int,
+        reward: float,
+    ) -> None:
+        x_T = metrics.get("_x_T") or metrics.get("x_T")
+        if x_T is not None and self.frontier_buffer is not None:
+            try:
+                from buffer.frontier_buffer import FrontierEntry
+                entry = FrontierEntry(
+                    x_T=np.array(x_T, dtype=np.float32),
+                    target=target,
+                    levers={"timestep": timestep, "hotspot_mode": hotspot_mode,
+                            "length_delta": length_delta},
+                    reward=reward,
+                    metrics=metrics,
+                )
+                self.frontier_buffer.update(entry)
+            except Exception as e:
+                log.warning("FrontierBuffer update failed: %s", e)
 
     def decode_action(self, action: int) -> dict[str, Any]:
-        return {"direction_scale": INTERVENTION_SCALES[int(action)]}
+        return {"hotspot_mode": HOTSPOT_MODES[int(action)]}
 
     @property
     def n_actions(self) -> int:
-        return _N_INTERVENTION_ACTIONS
+        return len(HOTSPOT_MODES)
