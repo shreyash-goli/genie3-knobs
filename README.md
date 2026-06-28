@@ -14,6 +14,8 @@ does **not** validate diffusion-score-as-action; it only tells us whether the "t
 framing has enough signal to justify the bigger build. **The contextual bandit is the bar
 that matters** — if PPO can't beat it, the RL framing isn't earning its complexity yet.
 
+The bandit is a policy that picks one hotspot mode at the start of the episode and applies it identically at all 10 steps — no state observation, no sequential reasoning. It's the "just always use all hotspots" or "pick randomly and stick with it" baseline. 
+
 ## The three levers (action space)
 
 | lever | values | realised in data as |
