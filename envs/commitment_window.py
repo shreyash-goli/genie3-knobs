@@ -158,16 +158,27 @@ class DiffusionInterventionEnv(gym.Env):
     Action space  : Discrete(3) — index into HOTSPOT_MODES
     Observation   : target one-hot + [step_progress, t_norm, length_delta_norm,
                     best_iptm, best_neg_ipae]  (all float32)
-    Reward        : 0 at steps 0..N-2; sparse terminal at step N-1
+    Reward        : intermediate_reward_scale * compute_reward(metrics) at steps 0..N-2;
+                    compute_reward(metrics) at step N-1 (terminal, unscaled)
+
+    intermediate_reward_scale=0.0 reproduces the original sparse-terminal behaviour.
+    intermediate_reward_scale=0.1 gives a small per-step shaping signal (iCS proxy)
+    while keeping the terminal reward the dominant signal.
+
+    window_start_override / window_end_override bypass per-target CommitmentWindow
+    detection with a fixed boundary, used for the window-placement sweep.
 
     Parameters
     ----------
-    targets            : list of target names to train on
-    commitment_windows : per-target CommitmentWindow (from CommitmentWindowDetector)
-    frontier_buffer    : FrontierBuffer instance for x_T seed caching (optional)
-    oracle_mode        : "offline" (uses OfflineRewardModel) or "live" (runs genie3)
-    n_children         : children per oracle call when oracle_mode="live"
-    seed               : random seed
+    targets                  : list of target names to train on
+    commitment_windows        : per-target CommitmentWindow (from CommitmentWindowDetector)
+    frontier_buffer           : FrontierBuffer instance for x_T seed caching (optional)
+    oracle_mode               : "offline" (uses OfflineRewardModel) or "live" (runs genie3)
+    n_children                : children per oracle call when oracle_mode="live"
+    intermediate_reward_scale : scale factor for per-step intermediate reward (default 0.0)
+    window_start_override     : override window start for all targets (sweep use)
+    window_end_override       : override window end for all targets (sweep use)
+    seed                      : random seed
     """
 
     metadata = {"render_modes": []}
@@ -181,12 +192,18 @@ class DiffusionInterventionEnv(gym.Env):
         frontier_buffer: Optional[Any] = None,
         oracle_mode: str = "offline",
         n_children: int = 5,
+        intermediate_reward_scale: float = 0.0,
+        window_start_override: Optional[int] = None,
+        window_end_override: Optional[int] = None,
         seed: Optional[int] = None,
     ):
         super().__init__()
         self.oracle_mode = oracle_mode
         self.n_children = n_children
         self.frontier_buffer = frontier_buffer
+        self.intermediate_reward_scale = intermediate_reward_scale
+        self.window_start_override = window_start_override
+        self.window_end_override = window_end_override
         self._rng = np.random.default_rng(seed)
 
         if targets is not None:
@@ -243,8 +260,10 @@ class DiffusionInterventionEnv(gym.Env):
         )
 
         cw = self.commitment_windows.get(self._current_target)
-        ws = cw.window_start if cw is not None else _DEFAULT_WINDOW_START
-        we = cw.window_end if cw is not None else _DEFAULT_WINDOW_END
+        ws = self.window_start_override if self.window_start_override is not None else (
+            cw.window_start if cw is not None else _DEFAULT_WINDOW_START)
+        we = self.window_end_override if self.window_end_override is not None else (
+            cw.window_end if cw is not None else _DEFAULT_WINDOW_END)
         self._timestep_sched = _timestep_schedule(ws, we, N_WINDOW_STEPS)
 
         self._step_count = 0
@@ -277,13 +296,13 @@ class DiffusionInterventionEnv(gym.Env):
         self._step_count += 1
         terminated = self._step_count >= N_WINDOW_STEPS
 
+        from oracle.reward_oracle import compute_reward
         if terminated:
-            from oracle.reward_oracle import compute_reward
             reward = float(compute_reward(metrics))
             self._maybe_cache_x_T(metrics, target, timestep, hotspot_mode,
                                   length_delta, reward)
         else:
-            reward = 0.0
+            reward = self.intermediate_reward_scale * float(compute_reward(metrics))
 
         obs = self._make_obs()
         info = dict(
