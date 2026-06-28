@@ -1,6 +1,6 @@
 # genie3-rl-knobs
 
-**RL-over-search-knobs for Genie3 binder design** — AlQuraishi Lab.
+**RL-over-search-knobs for Genie3 binder design** 
 
 > **Can a learned policy select among Genie3's conditioning knobs better than a fixed
 > heuristic or a contextual bandit?**
@@ -176,8 +176,7 @@ Requires live oracle. Current result: +0.167 pre→post, n=3 eval episodes (not 
 
 ## Experiment log
 
-See [`RESULTS.md`](RESULTS.md) for full results through the windowed MDP and window-start
-sweep. Summary of key findings:
+Summary of key findings:
 
 | Finding | Evidence |
 |---|---|
@@ -222,8 +221,6 @@ tests/                             env shapes, compute_reward, bandit, ingest pa
 ---
 
 ## Next steps
-
-See [`NEXT_STEPS.md`](NEXT_STEPS.md) for the prioritised queue. In order:
 
 1. **Fill lever grid** — run live oracle to fill ~8 missing (hotspot_mode × length_delta)
    cells at branch_t=800 for BHRF1 and InsulinR; removes the ~40% backoff caveat
