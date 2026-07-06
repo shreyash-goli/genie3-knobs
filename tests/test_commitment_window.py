@@ -227,3 +227,66 @@ class TestDiffusionInterventionEnv:
             cur_progress = obs[n_targets]
             assert cur_progress >= prev_progress
             prev_progress = cur_progress
+
+
+# ---------------------------------------------------------------------------
+# DiffusionInterventionEnv — live mode oracle call count (NEXT_STEPS.md section 0.2)
+#
+# Regression test for a bug where _query_oracle called the full LiveRewardModel on every
+# one of the N_WINDOW_STEPS steps instead of once per episode (at the terminal step only),
+# making a live episode cost ~10x its documented/budgeted time.
+# ---------------------------------------------------------------------------
+
+class _CountingLiveRewardModel:
+    """Stand-in for oracle.live_oracle.LiveRewardModel that counts calls instead of
+    shelling out to genie3."""
+
+    call_count = 0
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def sample(self, target, timestep, hotspot_mode="all", length_delta=0):
+        type(self).call_count += 1
+        return {"iptm": 0.9, "avg_interface_pae": 5.0, "complex_success": True}, 0
+
+
+class TestLiveModeOracleCallCount:
+    def test_live_episode_calls_oracle_exactly_once(self, monkeypatch):
+        monkeypatch.setattr(
+            "oracle.live_oracle.LiveRewardModel", _CountingLiveRewardModel
+        )
+        _CountingLiveRewardModel.call_count = 0
+
+        env = DiffusionInterventionEnv(
+            targets=["01_bhrf1"], oracle_mode="live", seed=0,
+        )
+        env.reset(seed=0)
+        done = False
+        n_steps = 0
+        while not done:
+            _, _, terminated, truncated, _ = env.step(0)
+            done = terminated or truncated
+            n_steps += 1
+
+        assert n_steps == N_WINDOW_STEPS
+        assert _CountingLiveRewardModel.call_count == 1
+
+    def test_non_terminal_live_steps_get_zero_reward(self, monkeypatch):
+        monkeypatch.setattr(
+            "oracle.live_oracle.LiveRewardModel", _CountingLiveRewardModel
+        )
+        _CountingLiveRewardModel.call_count = 0
+
+        env = DiffusionInterventionEnv(
+            targets=["01_bhrf1"], oracle_mode="live",
+            intermediate_reward_scale=0.5, seed=0,
+        )
+        env.reset(seed=0)
+        for _ in range(N_WINDOW_STEPS - 1):
+            _, reward, terminated, _, _ = env.step(0)
+            assert reward == pytest.approx(0.0)
+            assert not terminated
+        _, terminal_reward, terminated, _, _ = env.step(0)
+        assert terminated
+        assert terminal_reward > 0.0

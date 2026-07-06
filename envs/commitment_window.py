@@ -285,8 +285,11 @@ class DiffusionInterventionEnv(gym.Env):
         timestep = self._timestep_sched[self._step_count]
         target = self._current_target
         length_delta = self._current_length_delta
+        is_terminal_step = (self._step_count + 1) >= N_WINDOW_STEPS
 
-        metrics, backoff = self._query_oracle(target, timestep, hotspot_mode, length_delta)
+        metrics, backoff = self._query_oracle(
+            target, timestep, hotspot_mode, length_delta, is_terminal_step
+        )
 
         iptm = metrics.get("iptm") or 0.0
         ipae = metrics.get("avg_interface_pae") or 30.0
@@ -319,7 +322,8 @@ class DiffusionInterventionEnv(gym.Env):
     # -- internal helpers ----------------------------------------------------
 
     def _query_oracle(
-        self, target: str, timestep: int, hotspot_mode: str, length_delta: int
+        self, target: str, timestep: int, hotspot_mode: str, length_delta: int,
+        is_terminal_step: bool = True,
     ) -> tuple[dict[str, Any], int]:
         if self.oracle_mode == "offline":
             return self._oracle.sample(
@@ -328,7 +332,15 @@ class DiffusionInterventionEnv(gym.Env):
                 hotspot_mode=hotspot_mode,
                 length_delta=length_delta,
             )
-        # live mode: shell out to genie3
+        # Live mode: the oracle is expensive (~10 min: full Genie3 -> ProteinMPNN ->
+        # ColabFold). Pay that cost once per episode, at the terminal step only -- matching
+        # the windowed MDP's documented design ("10 branch points, not 10 full oracle
+        # calls"). Non-terminal steps get an empty metrics dict (compute_reward() -> 0.0)
+        # until a genuinely cheap intermediate signal exists (NEXT_STEPS.md section 7.1); calling
+        # the live oracle at every one of the 10 steps made a live episode cost ~100 min
+        # instead of ~10 min, silently blowing the Stage 7 SLURM time budget.
+        if not is_terminal_step:
+            return {}, 0
         from oracle.live_oracle import LiveRewardModel
         oracle = LiveRewardModel()
         return oracle.sample(
