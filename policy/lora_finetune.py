@@ -148,12 +148,14 @@ def load_lora(base_model, adapter_dir: Path):
 
 @dataclass
 class Rollout:
-    """One complete diffusion-trajectory episode."""
-    obs: Any               # observation at episode start (np.ndarray)
-    action: int            # direction_scale action chosen
+    """One environment step. A full episode is a sequence of these (10 for the windowed
+    DiffusionInterventionEnv; 1 for the original one-shot direction_scale env)."""
+    obs: Any               # observation before this step (np.ndarray)
+    action: int            # action chosen
     log_prob: float        # log π_old(a|s)
-    reward: float          # terminal compute_reward()
-    value: float           # V(s) estimate from critic
+    reward: float          # reward from this step (intermediate or terminal)
+    value: float           # V(s) estimate from critic, evaluated on `obs`
+    done: bool             # True if this step ended the episode (terminated or truncated)
     metrics: dict          # full oracle metrics for logging
 
 
@@ -172,13 +174,25 @@ class RolloutBuffer:
         return len(self._rollouts)
 
     def advantages_and_returns(self) -> tuple[list[float], list[float]]:
-        """GAE-style advantages for one-step episodes (trivially: A = R - V)."""
-        advantages, returns = [], []
-        for r in self._rollouts:
-            ret = r.reward  # one-step: no discounting needed
-            adv = ret - r.value
-            advantages.append(adv)
-            returns.append(ret)
+        """GAE(λ) advantages over the buffered rollouts.
+
+        Rollouts are stored in the temporal order they were collected -- possibly several
+        full episodes back to back. ``done`` marks the last step of each episode, which cuts
+        off bootstrapping and the backward GAE accumulation at episode boundaries so value
+        estimates never leak across episodes. For one-step episodes (every rollout has
+        ``done=True``) this collapses to the original trivial ``A = R - V``.
+        """
+        n = len(self._rollouts)
+        advantages = [0.0] * n
+        last_gae = 0.0
+        for t in reversed(range(n)):
+            r = self._rollouts[t]
+            next_value = self._rollouts[t + 1].value if t + 1 < n else 0.0
+            next_non_terminal = 0.0 if r.done else 1.0
+            delta = r.reward + self.gamma * next_value * next_non_terminal - r.value
+            last_gae = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+            advantages[t] = last_gae
+        returns = [adv + self._rollouts[t].value for t, adv in enumerate(advantages)]
         return advantages, returns
 
     def clear(self) -> None:
@@ -239,6 +253,11 @@ def train_lora_ppo(
     trajectory is differentiable.  In offline mode this is a standard discrete
     PPO over the intervention action space.
 
+    Each episode is stepped to completion (``terminated`` or ``truncated``) before the next
+    ``env.reset()`` -- this is a real multi-step rollout, not a single env.step() per episode,
+    so it works correctly for both the one-shot direction_scale env (1 step/episode) and the
+    windowed DiffusionInterventionEnv (10 steps/episode). ``ppo_update_freq`` counts episodes.
+
     Parameters
     ----------
     env          : DiffusionInterventionEnv instance
@@ -270,28 +289,39 @@ def train_lora_ppo(
     episode = 0
 
     while episode < cfg.total_episodes:
-        obs, info = env.reset()
-        target = info["target"]
-        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+        obs, _info = env.reset()
+        done = False
+        ep_reward = 0.0
 
-        with torch.no_grad():
-            logits, value = actor_critic(obs_t)
-            dist = torch.distributions.Categorical(logits=logits)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
+        # Step the episode to completion (terminated or truncated) before resetting again --
+        # DiffusionInterventionEnv is a 10-step MDP; stopping after one step (as this loop
+        # used to) meant training only ever saw step 0 and the terminal-reward branch of
+        # env.step() was never reached.
+        while not done:
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                logits, value = actor_critic(obs_t)
+                dist = torch.distributions.Categorical(logits=logits)
+                action = dist.sample()
+                log_prob = dist.log_prob(action)
 
-        _, reward, _, _, step_info = env.step(int(action.item()))
-        episode_rewards.append(reward)
+            next_obs, reward, terminated, truncated, step_info = env.step(int(action.item()))
+            done = terminated or truncated
+            ep_reward += reward
 
-        buffer.add(Rollout(
-            obs=obs,
-            action=int(action.item()),
-            log_prob=float(log_prob.item()),
-            reward=reward,
-            value=float(value.item()),
-            metrics=step_info,
-        ))
+            buffer.add(Rollout(
+                obs=obs,
+                action=int(action.item()),
+                log_prob=float(log_prob.item()),
+                reward=reward,
+                value=float(value.item()),
+                done=done,
+                metrics=step_info,
+            ))
+            obs = next_obs
+
         episode += 1
+        episode_rewards.append(ep_reward)
 
         if verbose and episode % 10 == 0:
             recent = episode_rewards[-10:]
@@ -300,8 +330,9 @@ def train_lora_ppo(
                 episode, cfg.total_episodes, sum(recent) / len(recent), len(buffer),
             )
 
-        # PPO update
-        if len(buffer) >= cfg.ppo_update_freq or episode == cfg.total_episodes:
+        # PPO update every ppo_update_freq *episodes* (buffer holds that many episodes'
+        # worth of steps, not raw step count -- ppo_update_freq is an episode count).
+        if episode % cfg.ppo_update_freq == 0 or episode == cfg.total_episodes:
             _ppo_update(actor_critic, optimizer, buffer, cfg)
             buffer.clear()
 
