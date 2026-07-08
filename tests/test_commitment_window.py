@@ -126,6 +126,33 @@ class TestDiffusionInterventionEnv:
         assert obs.shape == env.observation_space.shape
         assert obs.dtype == np.float32
 
+    def test_seeded_oracle_is_reproducible(self):
+        """Two same-seed envs must produce identical reward sequences for the same actions
+        (offline oracle RNG is seeded from the env seed). Without this the oracle draws a
+        random logged child per cell, adding a large noise floor (see §6)."""
+        def rollout(seed):
+            env = self._make_env(["01_bhrf1", "06_insulinr"], seed=seed)
+            env.reset(seed=seed)
+            rewards = []
+            done = False
+            while not done:
+                _, r, term, trunc, _ = env.step(0)
+                rewards.append(r)
+                done = term or trunc
+            return rewards
+
+        assert rollout(123) == rollout(123)          # identical seed -> identical rewards
+
+    def test_mask_target_onehot_zeros_the_onehot_block(self):
+        n_targets = 2
+        env = DiffusionInterventionEnv(
+            targets=["01_bhrf1", "06_insulinr"], oracle_mode="offline",
+            mask_target_onehot=True, seed=0,
+        )
+        obs, _ = env.reset(options={"target": "01_bhrf1"})
+        # the target one-hot block (first n_targets entries) must be all-zero
+        assert np.allclose(obs[:n_targets], 0.0)
+
     def test_action_space_matches_hotspot_modes(self):
         env = self._make_env()
         assert env.action_space.n == len(HOTSPOT_MODES)
