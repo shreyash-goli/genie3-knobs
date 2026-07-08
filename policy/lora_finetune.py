@@ -417,3 +417,18 @@ class ActorCritic:
                 return self.policy_head(h), self.value_head(h)
 
         return _AC()
+
+
+def bias_policy_head_toward(actor_critic, action_idx: int, logit_bias: float = 1.0) -> None:
+    """Add `logit_bias` to the policy head's bias for `action_idx`, in-place, so the
+    freshly-built policy starts out favoring that action instead of a uniform categorical.
+
+    Rationale (NEXT_STEPS.md §6): with a random-init policy the first updates are driven by
+    noisy exploration across all 3 hotspot modes before the policy discovers the
+    obviously-good default; seeding the bias toward the empirically-best fixed mode gives it
+    a sensible starting point. Only the policy head's bias is touched — trunk weights and the
+    value head are untouched, so this changes the *initial* action distribution, not capacity.
+    """
+    import torch
+    with torch.no_grad():
+        actor_critic.policy_head.bias[action_idx] += logit_bias

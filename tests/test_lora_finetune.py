@@ -22,8 +22,31 @@ from policy.lora_finetune import (  # noqa: E402
     PPOFinetuneConfig,
     Rollout,
     RolloutBuffer,
+    bias_policy_head_toward,
     train_lora_ppo,
 )
+
+
+class TestBiasPolicyHeadToward:
+    def test_biases_initial_distribution_toward_target_action(self):
+        ac = ActorCritic.build(obs_dim=4, n_actions=3, hidden=(8,))
+        before = ac.policy_head.bias.detach().clone()
+        bias_policy_head_toward(ac, action_idx=2, logit_bias=1.5)
+        after = ac.policy_head.bias.detach()
+        # only index 2 changed, by exactly +1.5
+        assert float(after[2] - before[2]) == pytest.approx(1.5)
+        assert float(after[0] - before[0]) == pytest.approx(0.0)
+        assert float(after[1] - before[1]) == pytest.approx(0.0)
+
+    def test_makes_target_action_more_likely_under_argmax_on_average(self):
+        # a strong bias should make the biased action the argmax for most random inputs
+        ac = ActorCritic.build(obs_dim=4, n_actions=3, hidden=(8,))
+        bias_policy_head_toward(ac, action_idx=1, logit_bias=10.0)
+        picks = []
+        for _ in range(50):
+            logits, _ = ac(torch.randn(1, 4))
+            picks.append(int(logits.argmax(dim=-1).item()))
+        assert picks.count(1) >= 40  # dominated by the biased action
 
 
 class _FakeMultiStepEnv:

@@ -47,13 +47,20 @@ from envs.commitment_window import (
     N_WINDOW_STEPS,
 )
 from instrumentation.trajectory_logger import load_records
-from policy.lora_finetune import ActorCritic, PPOFinetuneConfig, train_lora_ppo
+from policy.lora_finetune import (
+    ActorCritic, PPOFinetuneConfig, bias_policy_head_toward, train_lora_ppo,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 N_TRAIN = int(os.environ.get("N_TRAIN", 500))
 N_EVAL  = int(os.environ.get("N_EVAL", 200))
+# §6 cheap fixes, off by default so the baseline run is unchanged:
+#   INIT_BIAS_LOGIT > 0 seeds the policy head's bias toward the best fixed hotspot mode.
+#   CLIP_RANGE overrides PPO's clip ε (default 0.2; §6 suggests trying 0.1).
+INIT_BIAS_LOGIT = float(os.environ.get("INIT_BIAS_LOGIT", 0.0))
+CLIP_RANGE      = float(os.environ.get("CLIP_RANGE", 0.2))
 
 
 # ---------------------------------------------------------------------------
@@ -123,10 +130,12 @@ def main():
     intermediate_reward_scale = float(os.environ.get("INTERMEDIATE_REWARD_SCALE", 0.1))
     log.info("intermediate_reward_scale=%.2f", intermediate_reward_scale)
 
+    seed = int(os.environ.get("SEED", 42))
+
     def make_env():
         return DiffusionInterventionEnv(
             targets=targets, commitment_windows=cw, oracle_mode="offline",
-            intermediate_reward_scale=intermediate_reward_scale, seed=42,
+            intermediate_reward_scale=intermediate_reward_scale, seed=seed,
         )
 
     train_env = make_env()
@@ -134,16 +143,33 @@ def main():
 
     obs_dim  = train_env.observation_space.shape[0]
     n_actions = train_env.n_actions
+    log.info("§6 fixes: INIT_BIAS_LOGIT=%.2f  CLIP_RANGE=%.2f", INIT_BIAS_LOGIT, CLIP_RANGE)
+
+    # --- Fixed bandits first, so the init bias can target the empirically-best mode ---
+    fixed_results = {}
+    for i, mode in enumerate(HOTSPOT_MODES):
+        r = _eval_policy(eval_env, _fixed_policy(i), N_EVAL, seed_offset=N_TRAIN)
+        fixed_results[mode] = r
+    best_fixed_mode = max(fixed_results, key=lambda m: statistics.mean(fixed_results[m]))
+    best_fixed_rewards = fixed_results[best_fixed_mode]
+    best_fixed_idx = HOTSPOT_MODES.index(best_fixed_mode)
+    log.info("best fixed mode = %s (idx %d), mean=%.4f",
+             best_fixed_mode, best_fixed_idx, statistics.mean(best_fixed_rewards))
 
     # --- PPO training ---
     log.info("Training PPO: %d episodes, %d steps/episode ...", N_TRAIN, N_WINDOW_STEPS)
     actor_critic = ActorCritic.build(obs_dim=obs_dim, n_actions=n_actions, hidden=(64, 64))
+    if INIT_BIAS_LOGIT > 0:
+        bias_policy_head_toward(actor_critic, best_fixed_idx, logit_bias=INIT_BIAS_LOGIT)
+        log.info("Applied init bias +%.2f toward action idx %d (%s)",
+                 INIT_BIAS_LOGIT, best_fixed_idx, best_fixed_mode)
     ppo_cfg = PPOFinetuneConfig(
         total_episodes=N_TRAIN,
         ppo_update_freq=32,
         n_epochs=4,
         batch_size=32,
         learning_rate=3e-4,
+        clip_range=CLIP_RANGE,
         save_every=N_TRAIN + 1,  # no mid-run checkpoints needed
         save_dir=str(config.EXPERIMENTS_LOG_DIR / "ppo_vs_bandit" / "checkpoints"),
     )
@@ -158,15 +184,6 @@ def main():
     # --- Eval: random bandit ---
     rng = np.random.default_rng(0)
     random_rewards = _eval_policy(eval_env, _random_policy(rng), N_EVAL, seed_offset=N_TRAIN)
-
-    # --- Eval: fixed bandits (one per hotspot mode) ---
-    fixed_results = {}
-    for i, mode in enumerate(HOTSPOT_MODES):
-        r = _eval_policy(eval_env, _fixed_policy(i), N_EVAL, seed_offset=N_TRAIN)
-        fixed_results[mode] = r
-
-    best_fixed_mode = max(fixed_results, key=lambda m: statistics.mean(fixed_results[m]))
-    best_fixed_rewards = fixed_results[best_fixed_mode]
 
     # --- Summary ---
     results = {
