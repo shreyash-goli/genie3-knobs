@@ -201,16 +201,152 @@ def _passes_developability(seq: str) -> tuple[bool, float, float]:
     return (g <= _GRAVY_MAX and abs(c) <= _NET_CHARGE_ABS_MAX), g, c
 
 
+# ---------------------------------------------------------------------------
+# Interface geometry: hotspot_coverage (geometric) and iCS (PAE-based)
+#
+# Both are computed from the ColabFold-predicted complex PDB. In that PDB the binder is
+# chain A (written first in the ColabFold fasta) and the target is chain B; hotspot
+# residues from the problem JSON (e.g. "B64") are chain B, residue 64 -- they map directly
+# to the target chain's residue numbers. See NEXT_STEPS.md §1.7/§1.8.
+# ---------------------------------------------------------------------------
+
+# Interface contact cutoff: two residues are "in contact" if their Cβ atoms (Cα for
+# glycine) are within this distance. 8 Å matches Proteina-Complexa's contact terms.
+_CONTACT_CUTOFF_ANGSTROM = 8.0
+# iCS temperature: p_ij = exp(-pae_ij / T). T ≈ 10 matches Promera's formulation.
+_ICS_TEMPERATURE = 10.0
+
+
+def _parse_pdb_cb_coords(pdb_path: Path) -> dict[tuple[str, int], "Any"]:
+    """Parse a PDB into {(chain, resnum): Cβ coordinate}. Uses Cα for residues without a
+    Cβ (glycine). Fixed-column parsing (not split()) so it is robust to missing spaces
+    between fields in the ColabFold output."""
+    import numpy as np
+    cb: dict[tuple[str, int], Any] = {}
+    ca: dict[tuple[str, int], Any] = {}
+    with open(pdb_path) as fh:
+        for line in fh:
+            if not line.startswith("ATOM"):
+                continue
+            atom = line[12:16].strip()
+            if atom not in ("CB", "CA"):
+                continue
+            chain = line[21]
+            resnum = int(line[22:26])
+            xyz = np.array(
+                [float(line[30:38]), float(line[38:46]), float(line[46:54])],
+                dtype=np.float32,
+            )
+            (cb if atom == "CB" else ca)[(chain, resnum)] = xyz
+    for key, coord in ca.items():
+        cb.setdefault(key, coord)  # glycine fallback
+    return cb
+
+
+def _compute_hotspot_coverage(
+    pdb_path: Path,
+    hotspot_residues: list[str],
+    binder_chain: str = "A",
+    cutoff: float = _CONTACT_CUTOFF_ANGSTROM,
+) -> Optional[float]:
+    """Fraction of hotspot residues within `cutoff` Å (Cβ–Cβ) of any binder residue.
+
+    `hotspot_residues` are problem-JSON strings like "B64" (chain letter + residue number).
+    Returns None if the binder chain is absent or no hotspot residue is present in the PDB
+    (so a missing/garbage structure yields None, not a misleading 0.0).
+    """
+    import numpy as np
+    coords = _parse_pdb_cb_coords(pdb_path)
+    binder = np.array([c for (ch, _), c in coords.items() if ch == binder_chain])
+    if binder.size == 0:
+        return None
+    covered = 0
+    n_valid = 0
+    for res in hotspot_residues:
+        chain = res[0]
+        resnum = int(res[1:])
+        cb = coords.get((chain, resnum))
+        if cb is None:
+            continue
+        n_valid += 1
+        if np.linalg.norm(binder - cb, axis=1).min() <= cutoff:
+            covered += 1
+    if n_valid == 0:
+        return None
+    return covered / n_valid
+
+
+def _interface_contact_pairs(
+    pdb_path: Path,
+    binder_chain: str = "A",
+    target_chain: str = "B",
+    cutoff: float = _CONTACT_CUTOFF_ANGSTROM,
+) -> list[tuple[int, int]]:
+    """All (binder_resnum, target_resnum) pairs within `cutoff` Å (Cβ–Cβ). These are the
+    interface contacts iCS averages the PAE-derived contact probability over."""
+    import numpy as np
+    coords = _parse_pdb_cb_coords(pdb_path)
+    binder = {rn: c for (ch, rn), c in coords.items() if ch == binder_chain}
+    target = {rn: c for (ch, rn), c in coords.items() if ch == target_chain}
+    pairs: list[tuple[int, int]] = []
+    for bi, bc in binder.items():
+        for ti, tc in target.items():
+            if np.linalg.norm(bc - tc) <= cutoff:
+                pairs.append((bi, ti))
+    return pairs
+
+
+def _compute_ics(
+    pae_matrix: "Any",
+    contact_pairs: list[tuple[int, int]],
+    binder_len: int,
+    temperature: float = _ICS_TEMPERATURE,
+) -> Optional[float]:
+    """Interface Contact Score (Promera / Jing et al.): mean PAE-derived contact
+    probability over the interface contact pairs.
+
+    `pae_matrix` is the ColabFold N×N PAE (N = binder_len + target_len), indexed by
+    fasta position (binder residues 0..binder_len-1, then target residues). `contact_pairs`
+    are (binder_resnum, target_resnum) with 1-based residue numbers from the PDB. Each
+    pair's PAE is symmetrized (mean of pae[i][j] and pae[j][i]) then mapped to a probability
+    p = exp(-pae / T); iCS is the mean p over all contacts. Returns None if there are no
+    contacts (nothing to average) so it is distinguishable from a real low score.
+    """
+    import numpy as np
+    if not contact_pairs:
+        return None
+    pae = np.asarray(pae_matrix, dtype=np.float32)
+    n = pae.shape[0]
+    probs = []
+    for b_resnum, t_resnum in contact_pairs:
+        i = b_resnum - 1                    # binder position in the PAE matrix
+        j = binder_len + (t_resnum - 1)     # target position (offset past the binder)
+        if not (0 <= i < n and 0 <= j < n):
+            continue
+        pae_ij = 0.5 * (pae[i, j] + pae[j, i])
+        probs.append(float(np.exp(-pae_ij / temperature)))
+    if not probs:
+        return None
+    return float(np.mean(probs))
+
+
 def _aggregate_children(
     children: list[dict[str, Any]],
     mean_pairwise_rmsd: Optional[float] = None,
     x_T: Optional[list] = None,
+    branch_dir: Optional[Path] = None,
+    hotspot_residues: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Aggregate per-child metrics into a single metrics dict (best-child-by-iptm).
 
     mean_pairwise_rmsd: Cα RMSD across children from metadata.json — used as the
     diversity proxy (normalised to [0, 1] over a 10Å scale). Pass None if unavailable;
     diversity will be 0.0 rather than silently wrong.
+
+    branch_dir + hotspot_residues: when both are provided, hotspot_coverage and iCS are
+    computed for the best child from its predicted-complex PDB (`child_{id}_predicted.pdb`)
+    and, for iCS, a `child_{id}_pae.npy` sidecar if eval.py persisted one. When either is
+    None (e.g. offline records, or a run predating the PAE sidecar), those metrics stay None.
     """
     valid = [c for c in children if c.get("iptm") is not None and "error" not in c]
     if not valid:
@@ -263,12 +399,21 @@ def _aggregate_children(
     if binder_seq:
         _, gravy, net_charge = _passes_developability(binder_seq)
 
+    # Geometric interface metrics for the best child, from its predicted-complex PDB.
+    hotspot_coverage = None
+    ics = None
+    if branch_dir is not None and hotspot_residues:
+        hotspot_coverage, ics = _best_child_interface_metrics(
+            branch_dir, best.get("child_id"), hotspot_residues, binder_seq
+        )
+
     return {
         "complex_success": best.get("complex_success", False),
         "iptm": best.get("iptm", 0.0),
         "avg_interface_pae": best.get("avg_interface_pae", 30.0),
         "min_interface_pae": best.get("min_interface_pae", 30.0),
-        "hotspot_coverage": None,  # not computed by eval.py; requires contact analysis
+        "hotspot_coverage": hotspot_coverage,
+        "ics": ics,
         "diversity": diversity,
         "n_children": len(valid),
         "n_success": n_success,
@@ -277,6 +422,43 @@ def _aggregate_children(
         "net_charge": net_charge,
         "x_T": x_T_np,
     }
+
+
+def _best_child_interface_metrics(
+    branch_dir: Path,
+    child_id: Optional[int],
+    hotspot_residues: list[str],
+    binder_seq: Optional[str],
+) -> tuple[Optional[float], Optional[float]]:
+    """(hotspot_coverage, ics) for one child, from its predicted PDB + optional PAE sidecar.
+
+    Any failure (missing PDB, unparseable structure) degrades to (None, None) rather than
+    raising — a metrics glitch must not crash an oracle call mid-episode.
+    """
+    if child_id is None:
+        return None, None
+    pdb_path = branch_dir / f"child_{child_id}_predicted.pdb"
+    if not pdb_path.exists():
+        log.warning("predicted PDB missing for interface metrics: %s", pdb_path)
+        return None, None
+    try:
+        hotspot_coverage = _compute_hotspot_coverage(pdb_path, hotspot_residues)
+    except Exception as e:
+        log.warning("hotspot_coverage failed for %s: %s", pdb_path, e)
+        hotspot_coverage = None
+
+    ics = None
+    pae_path = branch_dir / f"child_{child_id}_pae.npy"
+    if pae_path.exists() and binder_seq:
+        try:
+            import numpy as np
+            pae = np.load(pae_path)
+            contacts = _interface_contact_pairs(pdb_path)
+            ics = _compute_ics(pae, contacts, binder_len=len(binder_seq))
+        except Exception as e:
+            log.warning("iCS failed for %s: %s", pae_path, e)
+            ics = None
+    return hotspot_coverage, ics
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +617,10 @@ class LiveRewardModel:
                     x_T = meta.get("x_T")  # nested list [N_atoms, 3] or None
                 except Exception:
                     pass
-            metrics = _aggregate_children(children, mean_pairwise_rmsd=mean_rmsd, x_T=x_T)
+            metrics = _aggregate_children(
+                children, mean_pairwise_rmsd=mean_rmsd, x_T=x_T,
+                branch_dir=branch_dir, hotspot_residues=self._hotspot_residues(target),
+            )
             metrics["target"] = target
             metrics["branch_timestep"] = timestep
             metrics["hotspot_mode"] = hotspot_mode
