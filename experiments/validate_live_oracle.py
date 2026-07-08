@@ -54,6 +54,9 @@ def main():
             live_metrics, _ = live.sample(target, test_timestep, "all", 0)
             live_reward = compute_reward(live_metrics)
             live_ok = True
+            # x_T is a numpy array (frozen diffusion state) -- not JSON serializable;
+            # strip it before writing results.json (same pattern as fill_lever_grid.py).
+            live_metrics = {k: v for k, v in live_metrics.items() if k != "x_T"}
         except Exception as e:
             log.error("Live oracle failed for %s: %s", target, e)
             live_metrics = {"error": str(e)}

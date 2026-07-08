@@ -46,9 +46,6 @@ def main() -> None:
     # --- imports (safe: this script runs inside the genie3 conda env) ---
     import torch
     from genie3.config import load_experiment_config, to_generation_config
-    from genie3.generation.config.registry import build_sample_config_from_dict
-    from genie3.generation.model.registry import get_model
-    from collections import OrderedDict
 
     # These live in genie3's branching/scripts — add to path
     branching_scripts = genie3_root / "branching" / "scripts"
@@ -59,39 +56,30 @@ def main() -> None:
         TrajectoryBrancher,
         save_trajectory_outputs,
         load_model_and_sampler,
-        prepare_batch,
+        load_batch_from_dataset,
     )
 
-    # --- load model ---
+    # --- load model, diffusion, sampler, and sample_config in one call ---
+    # genie3's own load_model_and_sampler() now does the checkpoint loading + state-dict
+    # key renaming this wrapper used to duplicate manually, and additionally returns
+    # sample_config (it didn't used to). This wrapper previously called a separate
+    # prepare_batch(config, selection, device) to build the batch; that function no
+    # longer exists -- selection is now applied by mutating
+    # sample_config.dataset.selections before calling load_batch_from_dataset(), matching
+    # genie3's own branching/scripts/trajectory_branching.py::run_experiment().
     config_path = Path(args.config)
     run_config = load_experiment_config(str(config_path))
     generation_config = to_generation_config(run_config, shard_id=0, num_shards=1)
-    sample_config = build_sample_config_from_dict(generation_config)
-    checkpoint_path = str((genie3_root / sample_config.base.checkpoint).resolve())
-
-    model = get_model(sample_config.model.model)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = checkpoint["state_dict"]
-    updated_sd = OrderedDict()
-    for k, v in state_dict.items():
-        k2 = k.replace("_orig_mod.", "").replace(".linear_motif_template.", ".linear_cond_template.")
-        if k2.startswith("model."):
-            k2 = k2[len("model."):]
-        updated_sd[k2] = v
-    model.load_state_dict(updated_sd, strict=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    model, diffusion, sampler, sample_config = load_model_and_sampler(generation_config, device)
 
-    diffusion, sampler = load_model_and_sampler(generation_config, device)
+    if args.selection:
+        sample_config.dataset.selections = args.selection
 
     # --- prepare batch ---
     os.chdir(_orig_dir)
-    batch = prepare_batch(
-        config=sample_config,
-        selection=args.selection,
-        device=device,
-    )
+    batch, _problem_name = load_batch_from_dataset(sample_config, device)
     os.chdir(str(genie3_root))
 
     # --- run branching, capturing xl_frozen ---

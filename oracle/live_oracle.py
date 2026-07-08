@@ -46,7 +46,10 @@ log = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _conda_run(cmd: list[str], env_name: str, cwd: Path, timeout: int = 900) -> str:
+def _conda_run(
+    cmd: list[str], env_name: str, cwd: Path, timeout: int = 900,
+    extra_env: Optional[dict[str, str]] = None,
+) -> str:
     """Run ``cmd``, preferring the current Python if already in the target env.
 
     On NERSC compute nodes ``conda`` is not on PATH inside a job, and wrapping
@@ -54,6 +57,11 @@ def _conda_run(cmd: list[str], env_name: str, cwd: Path, timeout: int = 900) -> 
     the target conda env we replace ``python`` with sys.executable and drop the
     ``conda run`` wrapper entirely.  Falls back to ``conda run`` when running from
     a different env (e.g. a login node test).
+
+    ``extra_env``, if given, is merged over a copy of the current environment (e.g. to
+    scope ``CUDA_VISIBLE_DEVICES`` for a specific subprocess -- see
+    ``LiveRewardModel``'s device pinning). When omitted, the subprocess inherits the
+    parent environment unchanged, exactly as before.
     """
     import sys
     active_env = os.environ.get("CONDA_DEFAULT_ENV", "")
@@ -64,12 +72,17 @@ def _conda_run(cmd: list[str], env_name: str, cwd: Path, timeout: int = 900) -> 
     else:
         full_cmd = ["conda", "run", "--no-capture-output", "-n", env_name] + cmd
     log.debug("live_oracle shell: %s", " ".join(full_cmd))
+    env = None
+    if extra_env:
+        env = os.environ.copy()
+        env.update(extra_env)
     result = subprocess.run(
         full_cmd,
         cwd=str(cwd),
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -80,33 +93,67 @@ def _conda_run(cmd: list[str], env_name: str, cwd: Path, timeout: int = 900) -> 
     return result.stdout
 
 
-def _length_delta_to_variant_suffix(length_delta: int) -> str:
-    """Map length_delta integer to the dataset selection suffix Genie3 expects."""
-    if length_delta == 0:
-        return ""
-    return "_longbinder"  # +30 and +60 both use this variant; the actual extra length
-                          # is controlled by the problem JSON, not the suffix
+class NoDatasetVariant(ValueError):
+    """No genie3 problem JSON exists for this (target, hotspot_mode, length_delta)
+    combination. Distinct from ValueError so callers can catch it specifically and skip
+    the cell rather than shelling out to a dataloader that will come back empty."""
 
 
-def _hotspot_to_variant_suffix(hotspot_mode: str, target: str) -> str:
-    """Map hotspot_mode to dataset selection suffix (target-specific for missed_only)."""
-    if hotspot_mode == "all":
-        return ""
-    if hotspot_mode == "ablate_competitors":
-        return "_ablate_others"
-    if hotspot_mode == "missed_only":
-        # missed_only uses _only_<hotspot> naming in Genie3 sweep dirs;
-        # we use the plain _missed suffix in the live oracle selection
-        return "_missed"
-    raise ValueError(f"Unknown hotspot_mode: {hotspot_mode!r}")
+# Per-target hotspot-variant problem-file suffixes. These are NOT uniform across
+# targets: each ablation target was chosen individually by find_missed_hotspots.py
+# (see genie3's branching/hotspot_ablation/scripts/make_ablation_problems.py) --
+# BHRF1's missed hotspot is B92, InsulinR's is B83, hence "_only_B92" /
+# "_ablate_b83" rather than a generic suffix. Only entries present here have an
+# actual problem JSON in branching/hotspot_ablation/dataset/problems/; anything else
+# raises NoDatasetVariant. InsulinR has no missed_only variant at all yet -- its
+# "never attempted" hotspots (B59, B91) were identified but never turned into a
+# problem file (see NEXT_STEPS.md).
+_HOTSPOT_SUFFIX_BY_TARGET: dict[tuple[str, str], str] = {
+    ("01_bhrf1", "ablate_competitors"): "_ablate_others",
+    ("01_bhrf1", "missed_only"): "_only_B92",
+    ("06_insulinr", "ablate_competitors"): "_ablate_b83",
+}
+
+
+def _needs_ablation_config(hotspot_mode: str, length_delta: int) -> bool:
+    """True if this cell's problem JSON lives in the hotspot_ablation dataset tree
+    (needs experiment_hotspot_ablation.yaml) rather than the base binderbench tree
+    (needs experiment_trajectory_branching.yaml). Every variant file -- longbinder,
+    ablate_*, only_* -- lives under branching/hotspot_ablation/dataset/problems/; only
+    the bare (all, 0) selection lives in the base dataset."""
+    return not (hotspot_mode == "all" and length_delta == 0)
 
 
 def _build_selection(target: str, hotspot_mode: str, length_delta: int) -> str:
-    """Build the Genie3 dataset selection string for a lever cell."""
-    base = target
-    hs_suffix = _hotspot_to_variant_suffix(hotspot_mode, target)
-    len_suffix = _length_delta_to_variant_suffix(length_delta)
-    return base + hs_suffix + len_suffix
+    """Build the Genie3 dataset selection string for a lever cell.
+
+    Raises NoDatasetVariant if no problem JSON exists for this exact combination.
+    Only single-axis variants currently exist -- there is no problem file combining a
+    non-"all" hotspot_mode with length_delta=60 for any target (e.g. no
+    "01_bhrf1_ablate_others_longbinder"), so any such combination is unfillable until
+    someone generates it (see NEXT_STEPS.md).
+    """
+    if hotspot_mode == "all":
+        if length_delta == 0:
+            return target
+        if length_delta == 60:
+            return f"{target}_longbinder"
+        raise NoDatasetVariant(
+            f"No longbinder-style variant exists for {target} length_delta={length_delta}"
+        )
+
+    if length_delta != 0:
+        raise NoDatasetVariant(
+            f"No combined hotspot+length problem file exists for {target} "
+            f"hotspot_mode={hotspot_mode!r} length_delta={length_delta}"
+        )
+
+    suffix = _HOTSPOT_SUFFIX_BY_TARGET.get((target, hotspot_mode))
+    if suffix is None:
+        raise NoDatasetVariant(
+            f"No {hotspot_mode!r} problem-file variant exists for target {target!r}"
+        )
+    return target + suffix
 
 
 def _parse_child_metrics(branch_dir: Path) -> list[dict[str, Any]]:
@@ -245,7 +292,9 @@ class LiveRewardModel:
     Parameters
     ----------
     genie3_root : path to genie3 repo checkout (default: RLKNOBS_GENIE3_ROOT or ~/genie3)
-    config_yaml : path to experiment YAML (default: genie3_root/branching/configs/experiment_trajectory_branching.yaml)
+    config_yaml : force one experiment YAML for every call, overriding the automatic
+                  per-cell selection between the base and hotspot_ablation configs
+                  (default: None -- auto-select, see ``_config_for``)
     scratch_dir : writable scratch for live outputs (default: RLKNOBS_LIVE_SCRATCH or /tmp/rlknobs_live)
     conda_env   : name of the conda env that has genie3 installed (default: RLKNOBS_CONDA_ENV or "genie3")
     num_children: how many children to generate per oracle call (default: RLKNOBS_NUM_CHILDREN or 5)
@@ -268,10 +317,13 @@ class LiveRewardModel:
             or os.environ.get("RLKNOBS_GENIE3_ROOT")
             or Path.home() / "genie3"
         )
-        self.config_yaml = Path(
-            config_yaml
-            or os.environ.get("RLKNOBS_GENIE3_CONFIG")
-            or self.genie3_root / "branching" / "configs" / "experiment_trajectory_branching.yaml"
+        # Explicit override (arg or env var) forces one config for every call. Otherwise
+        # _config_for() picks per-cell between the base dataset (bare target, no
+        # hotspot/length variant) and the hotspot_ablation dataset (every variant --
+        # longbinder, ablate_*, only_* -- lives there, see _needs_ablation_config).
+        env_override = os.environ.get("RLKNOBS_GENIE3_CONFIG")
+        self._config_yaml_override = Path(config_yaml) if config_yaml else (
+            Path(env_override) if env_override else None
         )
         self.scratch_dir = Path(
             scratch_dir
@@ -283,6 +335,44 @@ class LiveRewardModel:
         self.device = device
         self.timeout = timeout
         self.scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    def _dataset_dir_for(self, hotspot_mode: str, length_delta: int) -> Path:
+        """Where eval.py should look for problem JSONs -- eval.py is genie3's own
+        script (not one we wrap) and has the same base-vs-ablation dataset split as
+        branching_wrapper.py, via its own --dataset-dir flag rather than a config YAML.
+        Must stay consistent with _config_for's routing."""
+        if _needs_ablation_config(hotspot_mode, length_delta):
+            return self.genie3_root / "branching" / "hotspot_ablation" / "dataset"
+        return self.genie3_root / "data" / "design" / "binder_design" / "binderbench"
+
+    def _config_for(self, hotspot_mode: str, length_delta: int) -> Path:
+        if self._config_yaml_override is not None:
+            return self._config_yaml_override
+        if _needs_ablation_config(hotspot_mode, length_delta):
+            return (
+                self.genie3_root / "branching" / "hotspot_ablation" / "configs"
+                / "experiment_hotspot_ablation.yaml"
+            )
+        return (
+            self.genie3_root / "branching" / "configs"
+            / "experiment_trajectory_branching.yaml"
+        )
+
+    def _hotspot_residues(self, target: str) -> Optional[list[str]]:
+        """The target's *full* hotspot residue set (e.g. ["B64", ...]) from the base
+        problem JSON. Always the base set, never an ablated variant -- hotspot_coverage
+        measures how many true hotspots the binder contacts, independent of which subset
+        was used for conditioning. Returns None if the problem JSON can't be read."""
+        problem_json = (
+            self.genie3_root / "data" / "design" / "binder_design" / "binderbench"
+            / "problems" / f"{target}.json"
+        )
+        try:
+            data = json.loads(problem_json.read_text())
+            return data["target_interface_residues"]["hotspot"]
+        except Exception as e:
+            log.warning("could not load hotspot residues for %s: %s", target, e)
+            return None
 
     def sample(
         self,
@@ -305,9 +395,10 @@ class LiveRewardModel:
 
         try:
             selection = _build_selection(target, hotspot_mode, length_delta)
+            config_yaml = self._config_for(hotspot_mode, length_delta)
             log.info(
-                "live_oracle: target=%s ts=%d hs=%s len=%d  selection=%s  run=%s",
-                target, timestep, hotspot_mode, length_delta, selection, run_id,
+                "live_oracle: target=%s ts=%d hs=%s len=%d  selection=%s  config=%s  run=%s",
+                target, timestep, hotspot_mode, length_delta, selection, config_yaml.name, run_id,
             )
 
             # Step 1: generate children via trajectory_branching.py
@@ -316,6 +407,7 @@ class LiveRewardModel:
                 timestep=timestep,
                 selection=selection,
                 num_children=self.num_children,
+                config_yaml=config_yaml,
             )
 
             # Step 2: evaluate with ProteinMPNN + ColabFold via eval.py
@@ -327,6 +419,7 @@ class LiveRewardModel:
                 sweep_root=out_dir,
                 problem=selection,
                 timestep=timestep,
+                dataset_dir=self._dataset_dir_for(hotspot_mode, length_delta),
             )
 
             # Step 3: parse and aggregate
@@ -373,32 +466,56 @@ class LiveRewardModel:
                 shutil.rmtree(out_dir, ignore_errors=True)
 
     def _run_branching(self, out_dir: Path, timestep: int, selection: str,
-                       num_children: int) -> None:
+                       num_children: int, config_yaml: Path) -> None:
         # Use our own wrapper (oracle/branching_wrapper.py) rather than calling
         # genie3's trajectory_branching.py directly. The wrapper imports TrajectoryBrancher
         # in-process, monkey-patches _denoise_to_branch_point to capture xl_frozen, and
         # writes x_T into metadata.json — all without touching genie3's source.
+        #
+        # branching_wrapper.py has no --device flag -- it always does
+        # torch.device("cuda") (i.e. whatever CUDA_VISIBLE_DEVICES exposes as index 0).
+        # CUDA_VISIBLE_DEVICES scoping is therefore the *only* way to pin this step to a
+        # specific physical GPU when running several LiveRewardModel instances
+        # concurrently (see MultiGPULiveRewardModel below).
         import sys as _sys
         repo_root = Path(__file__).resolve().parent.parent
         cmd = [
             _sys.executable, str(repo_root / "oracle" / "branching_wrapper.py"),
-            "--config", str(self.config_yaml),
+            "--config", str(config_yaml),
             "--timestep", str(timestep),
             "--num-children", str(num_children),
             "--output-dir", str(out_dir),
             "--selection", selection,
         ]
-        _conda_run(cmd, self.conda_env, cwd=self.genie3_root, timeout=self.timeout)
+        _conda_run(
+            cmd, self.conda_env, cwd=self.genie3_root, timeout=self.timeout,
+            extra_env={"CUDA_VISIBLE_DEVICES": str(self.device)},
+        )
 
-    def _run_eval(self, sweep_root: Path, problem: str, timestep: int) -> None:
+    def _run_eval(self, sweep_root: Path, problem: str, timestep: int, dataset_dir: Path) -> None:
+        # Scope CUDA_VISIBLE_DEVICES the same way as _run_branching, so a single
+        # LiveRewardModel instance uses exactly one physical GPU end-to-end. Once scoped,
+        # exactly one device is visible to this subprocess, so its own --device argument
+        # must be "0" (the re-numbered index), not self.device -- passing self.device here
+        # (e.g. "2") would ask eval.py for a device that doesn't exist from its restricted
+        # point of view.
+        #
+        # eval.py is genie3's own script (not one this repo wraps) and looks up the
+        # problem JSON itself via --dataset-dir (defaults to the base binderbench
+        # dataset) -- must be passed explicitly for hotspot/length variants, which live
+        # under branching/hotspot_ablation/dataset instead (see _dataset_dir_for).
         cmd = [
             "python", "branching/scripts/eval.py",
             "--sweep-root", str(sweep_root),
             "--problem", problem,
             "--timestep", str(timestep),
-            "--device", str(self.device),
+            "--device", "0",
+            "--dataset-dir", str(dataset_dir),
         ]
-        _conda_run(cmd, self.conda_env, cwd=self.genie3_root, timeout=self.timeout)
+        _conda_run(
+            cmd, self.conda_env, cwd=self.genie3_root, timeout=self.timeout,
+            extra_env={"CUDA_VISIBLE_DEVICES": str(self.device)},
+        )
 
     # Alias so it matches OfflineRewardModel's introspection API
     def targets(self) -> list[str]:
@@ -449,6 +566,81 @@ class AsyncLiveRewardModel:
 
     def shutdown(self, wait: bool = True) -> None:
         self._pool.shutdown(wait=wait)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU dispatch for embarrassingly-parallel batches (e.g. fill_lever_grid.py)
+# ---------------------------------------------------------------------------
+
+class MultiGPULiveRewardModel:
+    """Distributes independent sample() calls across N distinct physical GPUs.
+
+    Unlike ``AsyncLiveRewardModel`` (which pools concurrent calls onto a *single*
+    device -- useful for overlapping I/O, but every call still contends for one GPU's
+    compute), this creates one ``LiveRewardModel`` per device and gives each its own
+    dedicated single-worker executor. That guarantees at most one call is ever running
+    on a given device at a time (device isolation) while all N devices run concurrently
+    -- true multi-GPU parallelism for a batch of fully independent oracle calls (no
+    shared state between cells, e.g. a grid-fill sweep).
+
+    This does *not* speed up any single call -- it only helps when you have more than
+    one independent call to make. It requires the job to actually have ``len(devices)``
+    GPUs allocated (e.g. ``--gpus=N`` in SLURM); device indices are relative to what's
+    visible to this process (``CUDA_VISIBLE_DEVICES`` as set by SLURM), not absolute
+    physical GPU IDs.
+
+    Usage::
+
+        multi = MultiGPULiveRewardModel(devices=[0, 1, 2, 3])
+        futures = {
+            multi.submit(i, target, timestep, mode, length_delta): (target, timestep, mode, length_delta)
+            for i, (target, timestep, mode, length_delta) in enumerate(cells)
+        }
+        for fut in as_completed(futures):
+            metrics, backoff = fut.result()
+        multi.shutdown()
+    """
+
+    def __init__(self, devices: list[int], **kwargs):
+        if not devices:
+            raise ValueError("devices must be a non-empty list of GPU indices")
+        self._n = len(devices)
+        self._models = [LiveRewardModel(device=d, **kwargs) for d in devices]
+        # One single-worker executor per device: submissions to executor[i] always run
+        # strictly sequentially on device i, which is what makes device isolation safe
+        # even though call durations vary (a shared pool with N workers would NOT
+        # guarantee this -- a freed worker can pick up the next queued item regardless of
+        # which device it targets, so two items for the same device could end up running
+        # concurrently on two different worker threads).
+        self._executors = [ThreadPoolExecutor(max_workers=1) for _ in devices]
+
+    def submit(
+        self,
+        index: int,
+        target: str,
+        timestep: int,
+        hotspot_mode: str = "all",
+        length_delta: int = 0,
+    ) -> "Future[tuple[dict[str, Any], int]]":
+        """Submit one call, pinned to device ``index % num_devices``.
+
+        Assign ``index`` round-robin over your batch (e.g. the enumerate() index) so
+        calls spread evenly across all devices.
+        """
+        idx = index % self._n
+        return self._executors[idx].submit(
+            self._models[idx].sample, target, timestep, hotspot_mode, length_delta
+        )
+
+    def shutdown(self, wait: bool = True) -> None:
+        for ex in self._executors:
+            ex.shutdown(wait=wait)
 
     def __enter__(self):
         return self
