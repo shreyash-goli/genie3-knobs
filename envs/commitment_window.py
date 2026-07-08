@@ -195,6 +195,7 @@ class DiffusionInterventionEnv(gym.Env):
         intermediate_reward_scale: float = 0.0,
         window_start_override: Optional[int] = None,
         window_end_override: Optional[int] = None,
+        mask_target_onehot: bool = False,
         seed: Optional[int] = None,
     ):
         super().__init__()
@@ -204,6 +205,12 @@ class DiffusionInterventionEnv(gym.Env):
         self.intermediate_reward_scale = intermediate_reward_scale
         self.window_start_override = window_start_override
         self.window_end_override = window_end_override
+        # When True the target one-hot block stays all-zeros, so the policy cannot tell
+        # which target it is conditioning. Used by the §3.1 ablation to test whether the
+        # windowed-MDP PPO win is cross-target specialization (needs the one-hot) vs.
+        # genuine within-episode sequential learning (would survive without it). Keeps
+        # obs_dim identical so no other code changes are needed.
+        self.mask_target_onehot = mask_target_onehot
         self._rng = np.random.default_rng(seed)
 
         if targets is not None:
@@ -231,8 +238,14 @@ class DiffusionInterventionEnv(gym.Env):
         self._best_neg_ipae: float = 0.0
 
         if oracle_mode == "offline":
+            import random as _random
             from oracle.reward_oracle import OfflineRewardModel
-            self._oracle = OfflineRewardModel()
+            # Seed the oracle's child-sampling RNG when the env is seeded, so a fixed
+            # (config, seed) gives reproducible rewards. Without this the oracle draws a
+            # random logged child per cell each run, adding a large (~±0.024) noise floor
+            # that swamps the small PPO-vs-fixed margins (see §6 findings in NEXT_STEPS.md).
+            oracle_rng = _random.Random(seed) if seed is not None else None
+            self._oracle = OfflineRewardModel(rng=oracle_rng)
         else:
             self._oracle = None  # live oracle constructed lazily per-call
 
@@ -353,7 +366,7 @@ class DiffusionInterventionEnv(gym.Env):
     def _make_obs(self) -> np.ndarray:
         n_targets = len(self.targets)
         one_hot = np.zeros(n_targets, dtype=np.float32)
-        if self._current_target is not None:
+        if self._current_target is not None and not self.mask_target_onehot:
             one_hot[self._target_to_idx[self._current_target]] = 1.0
 
         step_progress = self._step_count / N_WINDOW_STEPS
