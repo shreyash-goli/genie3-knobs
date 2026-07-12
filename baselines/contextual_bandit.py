@@ -45,12 +45,17 @@ class ContextualBandit:
         oracle: Optional[OfflineRewardModel] = None,
         weights: Optional[RewardWeights] = None,
         seed: Optional[int] = None,
+        n_actions: Optional[int] = None,
     ):
         self.env = env
         self.exploration = exploration
         self.c = c
         self.epsilon = epsilon
-        self.n_actions = env.action_space.n
+        # n_actions defaults to the full action space, but can be restricted to a prefix of the
+        # arms -- e.g. the windowed DiffusionInterventionEnv exposes Discrete(4) where index 3 is
+        # the commit action; passing n_actions=len(HOTSPOT_MODES) makes the bandit the exact
+        # context-conditioned analogue of the fixed/random hotspot-only baselines.
+        self.n_actions = n_actions if n_actions is not None else env.action_space.n
         self.targets = list(env.targets)
         self.rng = np.random.default_rng(seed)
         self.weights = weights or env.reward_weights

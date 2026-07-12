@@ -47,6 +47,8 @@ from envs.commitment_window import (
     N_WINDOW_STEPS,
 )
 from instrumentation.trajectory_logger import load_records
+from oracle.reward_oracle import RewardWeights
+from baselines.contextual_bandit import ContextualBandit
 from policy.lora_finetune import (
     ActorCritic, PPOFinetuneConfig, bias_policy_head_toward, train_lora_ppo,
 )
@@ -103,6 +105,35 @@ def _fixed_policy(action: int):
 def _random_policy(rng: np.random.Generator):
     def fn(obs):
         return int(rng.integers(len(HOTSPOT_MODES)))
+    return fn
+
+
+def _train_bandit(env, bandit: ContextualBandit, targets: list[str], n_episodes: int):
+    """Train the contextual bandit online on the windowed MDP.
+
+    One decision per episode: the bandit selects a single hotspot arm at reset, that arm is
+    replayed across all N_WINDOW_STEPS steps (the per-target *constant* policy — the exact
+    context-conditioned analogue of _fixed_policy), and the episode return updates the arm.
+    Targets are cycled for balanced per-target coverage; seeds 0..n_episodes-1 are disjoint
+    from eval (which uses seed_offset=N_TRAIN)."""
+    for ep in range(n_episodes):
+        target = targets[ep % len(targets)]
+        obs, _ = env.reset(seed=ep, options={"target": target})
+        action = bandit.select(obs, target)
+        done = False
+        ep_return = 0.0
+        while not done:
+            obs, reward, terminated, truncated, _ = env.step(action)
+            ep_return += reward
+            done = terminated or truncated
+        bandit.update(target, action, ep_return)
+
+
+def _bandit_policy(bandit: ContextualBandit, n_targets: int):
+    """Exploration-free eval closure: recover target from the obs one-hot and play greedy."""
+    def fn(obs):
+        target = bandit.targets[int(np.argmax(np.asarray(obs)[:n_targets]))]
+        return bandit.greedy_action(target)
     return fn
 
 
@@ -185,9 +216,26 @@ def main():
     rng = np.random.default_rng(0)
     random_rewards = _eval_policy(eval_env, _random_policy(rng), N_EVAL, seed_offset=N_TRAIN)
 
+    # --- Contextual bandit (§3.1's implied baseline: per-target best constant arm) ---
+    # THE baseline that determines whether PPO earns its keep. Restricted to the 3 hotspot arms
+    # (excludes the commit action, idx 3) so it is the context-conditioned analogue of the fixed
+    # baselines. If PPO ~= bandit, the windowed-MDP "win" is cross-target specialization, not
+    # within-episode sequential learning (NEXT_STEPS.md §3.1).
+    log.info("Training contextual bandit (UCB, per-target) on %d episodes ...", N_TRAIN)
+    bandit = ContextualBandit(
+        train_env, exploration="ucb", warm_start=False,
+        oracle=train_env._oracle, weights=RewardWeights(),
+        n_actions=len(HOTSPOT_MODES), seed=seed,
+    )
+    _train_bandit(train_env, bandit, targets, N_TRAIN)
+    log.info("bandit policy table: %s", bandit.policy_table())
+    bandit_rewards = _eval_policy(
+        eval_env, _bandit_policy(bandit, len(targets)), N_EVAL, seed_offset=N_TRAIN)
+
     # --- Summary ---
     results = {
         "ppo":          _summarise(ppo_rewards,        "PPO (trained)"),
+        "bandit":       _summarise(bandit_rewards,     "contextual bandit"),
         "random":       _summarise(random_rewards,     "random bandit"),
         "best_fixed":   _summarise(best_fixed_rewards, f"fixed bandit ({best_fixed_mode})"),
         "fixed_by_mode": {
@@ -204,6 +252,9 @@ def main():
         },
         "delta_ppo_vs_best_fixed": (
             statistics.mean(ppo_rewards) - statistics.mean(best_fixed_rewards)
+        ),
+        "delta_ppo_vs_bandit": (
+            statistics.mean(ppo_rewards) - statistics.mean(bandit_rewards)
         ),
         "delta_ppo_vs_random": (
             statistics.mean(ppo_rewards) - statistics.mean(random_rewards)
@@ -222,6 +273,7 @@ def main():
     print(f"{'='*55}")
     rows = [
         ("PPO (trained)",                 ppo_rewards),
+        ("contextual bandit",             bandit_rewards),
         (f"best fixed ({best_fixed_mode})", best_fixed_rewards),
         ("random bandit",                 random_rewards),
     ]
@@ -232,8 +284,9 @@ def main():
     print(f"{'='*55}")
     ppo_mean = statistics.mean(ppo_rewards)
     bf_mean  = statistics.mean(best_fixed_rewards)
-    print(f"  PPO vs best fixed:  {ppo_mean - bf_mean:+.4f}")
-    print(f"  PPO vs random:      {ppo_mean - statistics.mean(random_rewards):+.4f}")
+    print(f"  PPO vs best fixed:      {ppo_mean - bf_mean:+.4f}")
+    print(f"  PPO vs contextual bandit: {ppo_mean - statistics.mean(bandit_rewards):+.4f}")
+    print(f"  PPO vs random:          {ppo_mean - statistics.mean(random_rewards):+.4f}")
     print(f"{'='*55}\n")
 
 
