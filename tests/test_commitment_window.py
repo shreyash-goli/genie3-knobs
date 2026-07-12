@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from envs.commitment_window import (
+    COMMIT_ACTION,
     CommitmentWindowDetector,
     DiffusionInterventionEnv,
     HOTSPOT_MODES,
@@ -153,13 +154,15 @@ class TestDiffusionInterventionEnv:
         # the target one-hot block (first n_targets entries) must be all-zero
         assert np.allclose(obs[:n_targets], 0.0)
 
-    def test_action_space_matches_hotspot_modes(self):
+    def test_action_space_includes_commit(self):
+        # HOTSPOT_MODES conditioning arms + 1 commit action (§3.2).
         env = self._make_env()
-        assert env.action_space.n == len(HOTSPOT_MODES)
+        assert env.action_space.n == len(HOTSPOT_MODES) + 1
+        assert COMMIT_ACTION == len(HOTSPOT_MODES)
 
     def test_n_actions_property(self):
         env = self._make_env()
-        assert env.n_actions == len(HOTSPOT_MODES)
+        assert env.n_actions == len(HOTSPOT_MODES) + 1
 
     def test_episode_runs_n_window_steps(self):
         env = self._make_env()
@@ -255,6 +258,92 @@ class TestDiffusionInterventionEnv:
             assert cur_progress >= prev_progress
             prev_progress = cur_progress
 
+    # -- commit action (§3.2) ----------------------------------------------
+
+    def test_commit_terminates_early_with_terminal_reward(self):
+        env = self._make_env(["01_bhrf1"])
+        env.reset(seed=0)
+        env.step(0)  # one intermediate step (not terminal)
+        _, reward, terminated, truncated, info = env.step(COMMIT_ACTION)
+        assert terminated
+        assert truncated is False
+        assert info["termination_reason"] == "commit"
+        assert info["commit"] is True
+        assert info["step"] == 2  # ended at step 2, well before N_WINDOW_STEPS
+        assert isinstance(reward, float)
+
+    def test_commit_reward_matches_unscaled_terminal_reward(self):
+        # A commit must pay the full (unscaled) terminal reward, not the
+        # intermediate_reward_scale-shaped one.
+        from oracle.reward_oracle import compute_reward
+        env = DiffusionInterventionEnv(
+            targets=["01_bhrf1"], oracle_mode="offline",
+            intermediate_reward_scale=0.1, seed=3,
+        )
+        env.reset(seed=3)
+        _, reward, terminated, _, info = env.step(COMMIT_ACTION)
+        assert terminated
+        assert reward == pytest.approx(compute_reward(info))
+
+    def test_timeout_reason_when_window_elapses(self):
+        env = self._make_env(["01_bhrf1"])
+        env.reset(seed=0)
+        info = None
+        for _ in range(N_WINDOW_STEPS):
+            _, _, terminated, _, info = env.step(0)
+        assert terminated
+        assert info["termination_reason"] == "timeout"
+        assert info["commit"] is False
+
+    def test_commit_at_step_zero_is_allowed(self):
+        env = self._make_env(["01_bhrf1"])
+        env.reset(seed=0)
+        _, _, terminated, _, info = env.step(COMMIT_ACTION)
+        assert terminated
+        assert info["termination_reason"] == "commit"
+        assert info["step"] == 1
+
+    def test_decode_action_commit(self):
+        env = self._make_env()
+        assert env.decode_action(COMMIT_ACTION) == {"commit": True}
+
+    # -- action-history observation (§3.2/§3.3) ----------------------------
+
+    def test_obs_action_history_counts(self):
+        env = self._make_env(["01_bhrf1"])
+        n_targets = len(env.targets)
+        n_modes = len(HOTSPOT_MODES)
+        obs, _ = env.reset(seed=0)
+        # history block is the final n_modes entries, zero at reset
+        assert np.allclose(obs[-n_modes:], 0.0)
+        env.step(0)
+        env.step(0)
+        obs, _, _, _, _ = env.step(1)
+        history = obs[-n_modes:]
+        assert history[0] == pytest.approx(2.0 / N_WINDOW_STEPS)
+        assert history[1] == pytest.approx(1.0 / N_WINDOW_STEPS)
+        assert history[2] == pytest.approx(0.0)
+
+    def test_commit_does_not_increment_action_history(self):
+        env = self._make_env(["01_bhrf1"])
+        n_modes = len(HOTSPOT_MODES)
+        env.reset(seed=0)
+        env.step(0)
+        obs, _, _, _, _ = env.step(COMMIT_ACTION)
+        history = obs[-n_modes:]
+        # only the single hotspot step counts; commit does not
+        assert history[0] == pytest.approx(1.0 / N_WINDOW_STEPS)
+
+    def test_obs_prefix_unchanged_by_history_block(self):
+        # The one-hot block and step_progress must keep their original indices, so
+        # existing consumers/tests that index obs[:n_targets] / obs[n_targets] still work.
+        env = self._make_env(["01_bhrf1", "06_insulinr"])
+        n_targets = len(env.targets)
+        obs, _ = env.reset(seed=0, options={"target": "01_bhrf1"})
+        assert obs[0] == pytest.approx(1.0)
+        assert obs[1] == pytest.approx(0.0)
+        assert obs[n_targets] == pytest.approx(0.0)  # step_progress at reset
+
 
 # ---------------------------------------------------------------------------
 # DiffusionInterventionEnv — live mode oracle call count (NEXT_STEPS.md section 0.2)
@@ -317,3 +406,24 @@ class TestLiveModeOracleCallCount:
         _, terminal_reward, terminated, _, _ = env.step(0)
         assert terminated
         assert terminal_reward > 0.0
+
+    def test_commit_fires_the_single_live_oracle_call(self, monkeypatch):
+        # A commit ends the episode early; the one-call-per-episode invariant must hold,
+        # with the call fired at the commit step (not step N-1).
+        monkeypatch.setattr(
+            "oracle.live_oracle.LiveRewardModel", _CountingLiveRewardModel
+        )
+        _CountingLiveRewardModel.call_count = 0
+
+        env = DiffusionInterventionEnv(
+            targets=["01_bhrf1"], oracle_mode="live", seed=0,
+        )
+        env.reset(seed=0)
+        _, reward, terminated, _, info = env.step(0)   # intermediate: no oracle call
+        assert not terminated
+        assert _CountingLiveRewardModel.call_count == 0
+        _, reward, terminated, _, info = env.step(COMMIT_ACTION)
+        assert terminated
+        assert info["termination_reason"] == "commit"
+        assert _CountingLiveRewardModel.call_count == 1
+        assert reward > 0.0

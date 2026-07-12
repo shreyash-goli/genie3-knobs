@@ -56,6 +56,12 @@ HOTSPOT_MODES: tuple[str, ...] = ("all", "ablate_competitors", "missed_only")
 LENGTH_DELTAS: tuple[int, ...] = (0, 60)
 N_WINDOW_STEPS: int = 10
 
+# Learned "commit" action (NEXT_STEPS.md §3.2): the policy can end the episode early and
+# take the terminal reward from the current step instead of always running the full window.
+# It is *not* a member of HOTSPOT_MODES (those are the 3 conditioning arms the fixed-bandit
+# baselines enumerate) -- it is an extra action index appended after them.
+COMMIT_ACTION: int = len(HOTSPOT_MODES)
+
 # Default commitment window bounds used when per-target data is unavailable.
 _DEFAULT_WINDOW_START: int = 700
 _DEFAULT_WINDOW_END: int = 950
@@ -183,7 +189,9 @@ class DiffusionInterventionEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    _N_CONTEXT = 5  # step_progress, t_norm, length_delta_norm, best_iptm, best_neg_ipae
+    # step_progress, t_norm, length_delta_norm, best_iptm, best_neg_ipae,
+    # + per-hotspot-mode usage counts (action history, §3.2/§3.3)
+    _N_CONTEXT = 5 + len(HOTSPOT_MODES)
 
     def __init__(
         self,
@@ -227,7 +235,8 @@ class DiffusionInterventionEnv(gym.Env):
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
-        self.action_space = gym.spaces.Discrete(len(HOTSPOT_MODES))
+        # +1 for the commit action (§3.2).
+        self.action_space = gym.spaces.Discrete(len(HOTSPOT_MODES) + 1)
 
         # episode state
         self._current_target: Optional[str] = None
@@ -236,6 +245,8 @@ class DiffusionInterventionEnv(gym.Env):
         self._step_count: int = 0
         self._best_iptm: float = 0.0
         self._best_neg_ipae: float = 0.0
+        self._action_counts = np.zeros(len(HOTSPOT_MODES), dtype=np.float32)
+        self._last_action: Optional[int] = None
 
         if oracle_mode == "offline":
             import random as _random
@@ -251,7 +262,7 @@ class DiffusionInterventionEnv(gym.Env):
 
         log.info(
             "DiffusionInterventionEnv: mode=%s  targets=%s  |A|=%d  steps=%d",
-            oracle_mode, self.targets, len(HOTSPOT_MODES), N_WINDOW_STEPS,
+            oracle_mode, self.targets, len(HOTSPOT_MODES) + 1, N_WINDOW_STEPS,
         )
 
     # -- gymnasium API -------------------------------------------------------
@@ -282,6 +293,8 @@ class DiffusionInterventionEnv(gym.Env):
         self._step_count = 0
         self._best_iptm = 0.0
         self._best_neg_ipae = 0.0
+        self._action_counts = np.zeros(len(HOTSPOT_MODES), dtype=np.float32)
+        self._last_action = None
 
         obs = self._make_obs()
         return obs, {
@@ -292,13 +305,25 @@ class DiffusionInterventionEnv(gym.Env):
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
         assert self._current_target is not None, "call reset() before step()"
-        assert 0 <= int(action) < len(HOTSPOT_MODES), f"invalid action {action}"
+        assert 0 <= int(action) <= len(HOTSPOT_MODES), f"invalid action {action}"
 
-        hotspot_mode = HOTSPOT_MODES[int(action)]
+        action = int(action)
+        is_commit = action == COMMIT_ACTION
+        # A commit re-applies the last conditioning mode at the current timestep and ends the
+        # episode; on the very first step (no prior mode) it falls back to HOTSPOT_MODES[0].
+        if is_commit:
+            hotspot_mode = HOTSPOT_MODES[self._last_action] if self._last_action is not None \
+                else HOTSPOT_MODES[0]
+        else:
+            hotspot_mode = HOTSPOT_MODES[action]
+            self._action_counts[action] += 1.0
+            self._last_action = action
         timestep = self._timestep_sched[self._step_count]
         target = self._current_target
         length_delta = self._current_length_delta
-        is_terminal_step = (self._step_count + 1) >= N_WINDOW_STEPS
+        # A commit forces terminal handling: the full oracle must fire (matching the one-call-
+        # per-episode invariant in live mode), and the episode ends now.
+        is_terminal_step = is_commit or (self._step_count + 1) >= N_WINDOW_STEPS
 
         metrics, backoff = self._query_oracle(
             target, timestep, hotspot_mode, length_delta, is_terminal_step
@@ -310,7 +335,11 @@ class DiffusionInterventionEnv(gym.Env):
         self._best_neg_ipae = max(self._best_neg_ipae, 1.0 - ipae / 30.0)
 
         self._step_count += 1
-        terminated = self._step_count >= N_WINDOW_STEPS
+        terminated = is_commit or self._step_count >= N_WINDOW_STEPS
+        # "commit" when the policy chose to end early, else "timeout" (window elapsed).
+        # (Invalid-config / no-op reasons from §3.2 are not reachable with today's discrete
+        # lever space -- they become relevant only if continuous levers are added later.)
+        termination_reason = "commit" if is_commit else ("timeout" if terminated else None)
 
         from oracle.reward_oracle import compute_reward
         if terminated:
@@ -323,12 +352,14 @@ class DiffusionInterventionEnv(gym.Env):
         obs = self._make_obs()
         info = dict(
             metrics,
-            action=int(action),
+            action=action,
             hotspot_mode=hotspot_mode,
             timestep=timestep,
             length_delta=length_delta,
             backoff=backoff,
             step=self._step_count,
+            commit=is_commit,
+            termination_reason=termination_reason,
         )
         return obs, reward, terminated, False, info
 
@@ -383,7 +414,12 @@ class DiffusionInterventionEnv(gym.Env):
             self._best_iptm,
             self._best_neg_ipae,
         ], dtype=np.float32)
-        return np.concatenate([one_hot, context])
+        # Action history: per-mode usage counts so far, normalized by the window length.
+        # Order-invariant memory of which conditioning modes have been tried this episode
+        # (§3.2/§3.3). Appended AFTER the 5 scalar context features so existing obs indices
+        # (one-hot block, step_progress at index n_targets) are unchanged.
+        action_history = self._action_counts / float(N_WINDOW_STEPS)
+        return np.concatenate([one_hot, context, action_history])
 
     def _maybe_cache_x_T(
         self,
@@ -411,8 +447,10 @@ class DiffusionInterventionEnv(gym.Env):
                 log.warning("FrontierBuffer update failed: %s", e)
 
     def decode_action(self, action: int) -> dict[str, Any]:
+        if int(action) == COMMIT_ACTION:
+            return {"commit": True}
         return {"hotspot_mode": HOTSPOT_MODES[int(action)]}
 
     @property
     def n_actions(self) -> int:
-        return len(HOTSPOT_MODES)
+        return len(HOTSPOT_MODES) + 1

@@ -139,12 +139,12 @@ def main():
     buf = FrontierBuffer(size=64, epsilon=0.1, temperature=1.0, p_frontier=0.5, seed=0)
     buf.initialize(targets=poc_targets)
 
-    obs_dim_probe = DiffusionInterventionEnv(
+    _probe_env = DiffusionInterventionEnv(
         targets=poc_targets, commitment_windows=poc_windows, oracle_mode="offline"
-    ).observation_space.shape[0]
+    )
     actor_critic = ActorCritic.build(
-        obs_dim=obs_dim_probe,
-        n_actions=len(__import__("envs.commitment_window", fromlist=["HOTSPOT_MODES"]).HOTSPOT_MODES),
+        obs_dim=_probe_env.observation_space.shape[0],
+        n_actions=_probe_env.n_actions,
         hidden=(64, 64),
     )
 

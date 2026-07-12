@@ -127,6 +127,76 @@ class TestTrainLoraPPOMultiStepEpisodes:
         assert seen_buffer_lengths[-1] == env.N_STEPS
 
 
+class _FakeCommitEnv:
+    """5-step episode, Discrete(3): action 2 is a "commit" that ends the episode early with
+    the terminal reward, mirroring DiffusionInterventionEnv's commit action (§3.2) without
+    genie3/oracle. Used to check the training loop + GAE handle an early `done`."""
+
+    N_STEPS = 5
+    COMMIT = 2
+
+    def __init__(self):
+        import gymnasium as gym
+        self.observation_space = gym.spaces.Box(
+            low=-10.0, high=10.0, shape=(2,), dtype=np.float32
+        )
+        self.action_space = gym.spaces.Discrete(3)
+        self._step_count = 0
+
+    def reset(self, seed=None, options=None):
+        self._step_count = 0
+        return np.zeros(2, dtype=np.float32), {"target": "fake"}
+
+    def step(self, action):
+        self._step_count += 1
+        is_commit = int(action) == self.COMMIT
+        terminated = is_commit or self._step_count >= self.N_STEPS
+        reward = 1.0 if terminated else 0.0
+        obs = np.full(2, float(self._step_count), dtype=np.float32)
+        return obs, reward, terminated, False, {"termination_reason":
+                                                 "commit" if is_commit else "timeout"}
+
+
+class TestCommitActionEarlyTermination:
+    def test_commit_buffers_fewer_than_n_steps(self):
+        """A commit at step 2 must end the episode; the buffer sees 2 rollouts, not
+        N_STEPS, and the last one carries done=True so GAE cuts the bootstrap there."""
+        env = _FakeCommitEnv()
+        obs, _ = env.reset()
+        buffer = RolloutBuffer()
+        actions = [0, env.COMMIT]  # one hotspot step then commit
+        done = False
+        for a in actions:
+            _, value = (torch.zeros(1, 3), torch.zeros(1, 1))
+            next_obs, reward, terminated, truncated, info = env.step(a)
+            done = terminated or truncated
+            buffer.add(Rollout(obs=obs, action=a, log_prob=0.0, reward=reward,
+                               value=0.0, done=done, metrics=info))
+            obs = next_obs
+            if done:
+                break
+        assert len(buffer) == 2
+        assert buffer._rollouts[-1].done is True
+        assert buffer._rollouts[-1].metrics["termination_reason"] == "commit"
+        # GAE runs cleanly on the truncated episode (A = R - V here since done cuts bootstrap)
+        advantages, returns = buffer.advantages_and_returns()
+        assert len(advantages) == 2
+
+    def test_train_loop_handles_commit_env(self, tmp_path):
+        env = _FakeCommitEnv()
+        ac = ActorCritic.build(obs_dim=2, n_actions=3, hidden=(8,))
+        # strongly bias toward commit so most episodes terminate at step 1
+        bias_policy_head_toward(ac, action_idx=env.COMMIT, logit_bias=10.0)
+        cfg = PPOFinetuneConfig(
+            total_episodes=4, ppo_update_freq=2, batch_size=4, n_epochs=1,
+            save_every=100, save_dir=str(tmp_path),
+        )
+        log = train_lora_ppo(env, ac, cfg, verbose=False)
+        assert log["total_episodes"] == 4
+        # committing immediately still reaches the terminal reward of 1.0
+        assert all(r == pytest.approx(1.0) for r in log["episode_rewards"])
+
+
 class TestRolloutBufferGAE:
     def _episode(self, rewards, values, dones):
         return [
