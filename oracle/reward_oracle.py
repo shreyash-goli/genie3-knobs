@@ -29,9 +29,15 @@ from instrumentation.trajectory_logger import load_records
 # --------------------------------------------------------------------------------------
 @dataclass
 class RewardWeights:
-    """Weights for the terminal reward.  All terms are scaled to ~[0, 1] before weighting
-    so the weights are directly interpretable.  Edit freely -- nothing else depends on the
-    specific values."""
+    """Weights for the terminal reward.
+
+    ``compute_reward`` is tiered (NEXT_STEPS.md §2.2), not a flat weighted average: crossing
+    the designable+hotspot-coverage gate determines which regime a sample is in, and the
+    per-regime fields below set the shape *within* that regime. The old flat-average fields
+    (``interface_iptm`` etc.) are kept only for ``_legacy_weighted_average``, the fallback
+    used when a metrics dict carries no success-relevant signal at all (e.g. partial fixture
+    dicts in tests) -- see that function's docstring. Edit freely -- nothing else depends on
+    the specific values."""
     success: float = 1.0          # pass/fail (complex_success or thresholded iptm/ipae)
     interface_iptm: float = 0.5   # ipTM, higher better
     interface_ipae: float = 0.5   # interface pAE, lower better
@@ -43,6 +49,35 @@ class RewardWeights:
     ipae_pass: float = 10.0
     # normalisation constant for the ipae term (pAE in Angstrom; 30 ~ very bad)
     ipae_scale: float = 30.0
+
+    # -- tiered reward (§2.2) -----------------------------------------------------------
+    # Gate: a designable sample only reaches the top tier if it also covers this fraction
+    # of the target's hotspot residues. Not specified numerically in the design doc; 0.5
+    # ("covers a majority of hotspots") is a reasonable default and is the one knob most
+    # worth sweeping once real hotspot_coverage data exists.
+    hotspot_coverage_threshold: float = 0.5
+    # Tier 1 (designable + hotspot-gated): reward = success_base + coverage*hotspot_scale
+    #         + nuance*nuance_scale. ``nuance`` is meant to be iptm_energy (§2.3) -- a
+    #         free-energy quantity from pre-softmax PAE logits ColabFold doesn't expose
+    #         through this pipeline yet -- so normalized iptm is used as the stand-in until
+    #         that plumbing exists.
+    tier_success_base: float = 1.0
+    tier_hotspot_scale: float = 3.0
+    tier_nuance_scale: float = 1.0
+    # Tier 2 (designable, coverage below threshold or unknown): partial credit that still
+    # beats the fail tier. When hotspot_coverage is None (no PDB/PAE available for this
+    # sample) the coverage gap defaults to 0.5 (treat as half-covered) rather than 0 or 1,
+    # so an unmeasured sample doesn't get free full credit or unfairly maximal penalty.
+    tier_partial_base: float = 0.5
+    tier_partial_scale: float = 5.0
+    tier_partial_unknown_gap: float = 0.5
+    # Tier 3 (not designable): reward = -complex_scrmsd / tier_fail_scale. When scRMSD
+    # itself is unavailable (e.g. every ColabFold child failed -- see
+    # `_aggregate_children`'s early-return dict), fall back to this fixed penalty, chosen to
+    # be worse than a typical scored failure (scRMSD up to ~30 -> -3.0 already, so a total
+    # pipeline failure should not look better than a merely-bad structure).
+    tier_fail_scale: float = 10.0
+    tier_fail_no_scrmsd_penalty: float = -3.0
 
 
 def _success_term(metrics: dict[str, Any], w: RewardWeights) -> Optional[float]:
@@ -65,16 +100,57 @@ def compute_reward(
     history: Optional[list[dict[str, Any]]] = None,
     weights: Optional[RewardWeights] = None,
 ) -> float:
-    """Scalar terminal reward from an oracle metrics dict.
+    """Scalar terminal reward from an oracle metrics dict (NEXT_STEPS.md §2.2, tiered).
 
-    Robust to missing keys: any term whose inputs are ``None`` is dropped and the reward is
-    renormalised over the terms that *were* available, so partial metrics dicts (e.g. in
-    unit tests) never raise and never silently count a missing metric as zero.
+    Three tiers, not a weighted blend:
+      1. designable AND hotspot_coverage >= threshold -> success_base + coverage*scale +
+         nuance*scale  (unbounded above ~[1, 5]).
+      2. designable only -> partial credit, still positive but capped below tier 1.
+      3. not designable -> an explicit *negative* reward scaled by scRMSD, so failure is
+         unambiguous rather than just "a low positive score".
 
-    ``history`` is the list of metrics dicts already generated this round for the same
-    target; used only by the diversity term (penalise near-duplicates).
+    ``designable`` reuses the existing complex_success / thresholded-iptm+ipae check
+    (``_success_term``). This deliberately makes designability a gate rather than a
+    continuous term: unlike the old flat average, ipTM/pAE no longer shape the reward
+    smoothly once a sample is designable -- only the tier and (for tier 1) the nuance term
+    do. This is the tradeoff the tiered design makes for an unambiguous success signal.
+
+    Falls back to ``_legacy_weighted_average`` when ``metrics`` carries no success-relevant
+    signal at all (``_success_term`` returns None, i.e. no complex_success, iptm, or ipae) --
+    this keeps ``compute_reward`` well-defined for partial dicts (unit-test fixtures, a
+    diversity-only history entry) instead of forcing every caller to populate a full record.
+
+    ``history`` is accepted for signature compatibility with the legacy path and callers
+    that pass it; the tiered formula itself does not use it (§2.2 has no diversity term).
     """
     w = weights or RewardWeights()
+
+    designable = _success_term(metrics, w)
+    if designable is None:
+        return _legacy_weighted_average(metrics, history, w)
+
+    if designable == 1.0:
+        cov = metrics.get("hotspot_coverage")
+        if cov is not None and cov >= w.hotspot_coverage_threshold:
+            iptm = metrics.get("iptm")
+            nuance = float(max(0.0, min(1.0, iptm))) if iptm is not None else 0.0
+            return w.tier_success_base + cov * w.tier_hotspot_scale + nuance * w.tier_nuance_scale
+        gap = (1.0 - cov) if cov is not None else w.tier_partial_unknown_gap
+        return w.tier_partial_base - gap / w.tier_partial_scale
+
+    scrmsd = metrics.get("complex_scrmsd")
+    if scrmsd is not None:
+        return -float(scrmsd) / w.tier_fail_scale
+    return w.tier_fail_no_scrmsd_penalty
+
+
+def _legacy_weighted_average(
+    metrics: dict[str, Any],
+    history: Optional[list[dict[str, Any]]],
+    w: RewardWeights,
+) -> float:
+    """Pre-§2.2 flat weighted average over whatever terms are present, renormalised over
+    the terms that *were* available. Fallback path only -- see ``compute_reward``."""
     history = history or []
 
     terms: list[tuple[float, float]] = []  # (weight, value in [0,1])

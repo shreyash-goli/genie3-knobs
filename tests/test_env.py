@@ -60,7 +60,8 @@ def test_step_shapes_full_levers(oracle):
     for a in range(env.action_space.n):
         env.reset()
         obs, reward, term, trunc, info = env.step(a)
-        assert 0.0 <= reward <= 1.0
+        # tiered compute_reward (NEXT_STEPS.md §2.2) isn't bounded to [0,1]; just check shape.
+        assert isinstance(reward, float)
 
 
 def test_decode_action_roundtrip(oracle):

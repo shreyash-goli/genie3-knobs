@@ -174,8 +174,10 @@ class TestDiffusionInterventionEnv:
         _, reward, terminated, truncated, _ = env.step(0)
         assert terminated
         assert truncated is False
-        assert reward > 0.0 or reward == 0.0  # reward is a float (may be 0 for failed episode)
+        # tiered compute_reward (NEXT_STEPS.md §2.2) can be negative on a failed episode --
+        # only check it's a finite float, not a sign/bound tied to the old flat-average range.
         assert isinstance(reward, float)
+        assert reward == reward and abs(reward) != float("inf")
 
     def test_terminal_reward_is_nonzero_on_success(self):
         # Run many episodes until we get at least one non-zero terminal reward.

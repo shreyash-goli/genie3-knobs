@@ -1,16 +1,31 @@
-"""Unit tests for compute_reward -- callable with fixture metrics dicts, no genie3 needed."""
+"""Unit tests for compute_reward -- callable with fixture metrics dicts, no genie3 needed.
+
+compute_reward is tiered (NEXT_STEPS.md §2.2): designable + hotspot-gated > designable only
+> not designable, with an explicit negative reward in the fail tier. Falls back to the old
+flat weighted average (_legacy_weighted_average) only when a dict has no success-relevant
+signal at all.
+"""
 
 from __future__ import annotations
 
-from oracle.reward_oracle import RewardWeights, compute_reward
+from oracle.reward_oracle import RewardWeights, compute_reward, _legacy_weighted_average
 
 
-def test_compute_reward_returns_float_on_full_dict():
+def test_top_tier_requires_designable_and_hotspot_gate():
     metrics = {"iptm": 0.88, "avg_interface_pae": 4.7, "complex_success": True,
-               "hotspot_coverage": 0.83, "diversity": 0.5}
+               "hotspot_coverage": 0.83}
     r = compute_reward(metrics)
-    assert isinstance(r, float)
-    assert 0.0 <= r <= 1.0
+    w = RewardWeights()
+    assert r == w.tier_success_base + 0.83 * w.tier_hotspot_scale + 0.88 * w.tier_nuance_scale
+    assert r > w.tier_success_base  # comfortably above the tier floor
+
+
+def test_designable_below_hotspot_threshold_gets_partial_tier_not_top_tier():
+    below = {"complex_success": True, "hotspot_coverage": 0.1, "iptm": 0.95}
+    above = {"complex_success": True, "hotspot_coverage": 0.9, "iptm": 0.95}
+    assert compute_reward(below) < compute_reward(above)
+    w = RewardWeights()
+    assert compute_reward(below) < w.tier_success_base  # never reaches tier 1's floor
 
 
 def test_success_increases_reward():
@@ -20,26 +35,37 @@ def test_success_increases_reward():
     assert r_succ > r_fail
 
 
-def test_lower_ipae_is_better():
-    good = compute_reward({"avg_interface_pae": 2.0})
-    bad = compute_reward({"avg_interface_pae": 25.0})
-    assert good > bad
+def test_not_designable_is_negative_and_scales_with_scrmsd():
+    close = compute_reward({"complex_success": False, "complex_scrmsd": 2.0})
+    far = compute_reward({"complex_success": False, "complex_scrmsd": 20.0})
+    assert close < 0.0 and far < 0.0
+    assert far < close  # worse structure -> more negative
 
 
-def test_missing_keys_do_not_raise_and_renormalise():
-    # diversity is the one term with no other coupling -> reward equals it (renormalised)
+def test_not_designable_without_scrmsd_uses_fixed_worst_case_penalty():
+    w = RewardWeights()
+    assert compute_reward({"complex_success": False}) == w.tier_fail_no_scrmsd_penalty
+
+
+def test_unknown_hotspot_coverage_falls_back_to_partial_tier_default_gap():
+    w = RewardWeights()
+    r = compute_reward({"complex_success": True})  # no hotspot_coverage key at all
+    assert r == w.tier_partial_base - w.tier_partial_unknown_gap / w.tier_partial_scale
+
+
+def test_missing_success_signal_falls_back_to_legacy_weighted_average():
+    # diversity is the one term with no other coupling -> legacy path, reward equals it
     assert abs(compute_reward({"diversity": 0.7}) - 0.7) < 1e-9
-    # a lone iptm also drives the thresholded success term, so it must stay finite in range
-    r = compute_reward({"iptm": 0.6})
-    assert isinstance(r, float) and 0.0 <= r <= 1.0
-
-
-def test_empty_metrics_is_zero():
     assert compute_reward({}) == 0.0
 
 
-def test_weights_are_swappable():
-    metrics = {"iptm": 1.0, "avg_interface_pae": 30.0}  # great iptm, terrible ipae
-    only_iptm = RewardWeights(success=0.0, interface_iptm=1.0, interface_ipae=0.0)
-    only_ipae = RewardWeights(success=0.0, interface_iptm=0.0, interface_ipae=1.0)
-    assert compute_reward(metrics, weights=only_iptm) > compute_reward(metrics, weights=only_ipae)
+def test_legacy_fallback_matches_direct_call():
+    metrics = {"diversity": 0.4}
+    assert compute_reward(metrics) == _legacy_weighted_average(metrics, None, RewardWeights())
+
+
+def test_hotspot_coverage_threshold_is_swappable():
+    metrics = {"complex_success": True, "hotspot_coverage": 0.6, "iptm": 0.9}
+    lenient = RewardWeights(hotspot_coverage_threshold=0.5)
+    strict = RewardWeights(hotspot_coverage_threshold=0.9)
+    assert compute_reward(metrics, weights=lenient) > compute_reward(metrics, weights=strict)

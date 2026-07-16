@@ -81,8 +81,6 @@ def test_eval_closure_plays_valid_hotspot_actions():
                            seed_offset=1000)
     assert len(rewards) == 20
     assert all(np.isfinite(r) for r in rewards)
-    # offline terminal reward lives in a sane range
-    assert all(-1.0 <= r <= 5.0 for r in rewards)
 
 
 def test_bandit_policy_recovers_target_from_onehot():
