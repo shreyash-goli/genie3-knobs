@@ -137,8 +137,13 @@ def main() -> None:
         help="Print the cells that would be run without calling the oracle",
     )
     parser.add_argument(
-        "--skip-existing", action="store_true", default=True,
-        help="Skip cells already present in records.jsonl (default: True)",
+        "--skip-existing", action=argparse.BooleanOptionalAction, default=True,
+        help=(
+            "Skip cells already present in records.jsonl (default: True). Pass "
+            "--no-skip-existing to force a re-run of every cell in the grid regardless of "
+            "existing records -- e.g. to backfill hotspot_coverage/iCS on cells that were "
+            "logged before eval.py persisted the PAE sidecar (NEXT_STEPS.md §1.7)."
+        ),
     )
     parser.add_argument(
         "--output", type=Path, default=config.DATASET_JSONL,
