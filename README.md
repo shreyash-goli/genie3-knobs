@@ -9,6 +9,16 @@ A positive result here validates the three-levers framing and justifies the hard
 follow-up: steering the diffusion score directly. **The contextual bandit is the bar
 that matters** — if PPO can't beat it, the RL framing isn't earning its complexity.
 
+**Current answer (2026-07, windowed MDP):** on the 10-step commitment-window MDP, **PPO does
+not beat a per-target contextual bandit** (Δ ≈ −0.015, inside the ±0.024 seed noise floor).
+PPO's only real margin is over *random* conditioning (+0.10). Ablations (`target_onehot_ablation`,
+`window_start_ablation`) trace PPO's apparent "win" over a single fixed action entirely to
+**cross-target specialization** — the same effect the earlier one-shot Stage 1–3 experiments
+found — not to learning *when* to switch hotspot mode within an episode. The problem is
+contextual-bandit-shaped, not sequential-RL-shaped. See `NEXT_STEPS.md` §3.1 for the full
+evidence chain. This does not close the FK-Steering axis (§7) or the generalization-to-unseen-
+targets question (§5), both still open.
+
 ---
 
 ## Workflow Design
@@ -48,28 +58,38 @@ t=700–950 (out of 1000 total diffusion steps).
 ```
 Episode  = one protein binder design attempt for one target
 Steps    = N_WINDOW_STEPS = 10, uniformly spaced across the commitment window
-Action   = Discrete(3): which hotspot_mode to apply at this diffusion timestep
+Action   = Discrete(4): 3 hotspot_mode arms + a learned `commit` action (index 3)
 Length   = sampled once at reset() from {0, 60 AAs}, fixed for the whole episode
-Reward   = intermediate_reward_scale × compute_reward(metrics) at steps 0–8
-           compute_reward(metrics) at step 9 (terminal, unscaled)
+Reward   = intermediate_reward_scale × compute_reward(metrics) at non-terminal steps
+           compute_reward(metrics) at the terminal step (unscaled)
 ```
 
 `intermediate_reward_scale=0.0` gives the original sparse terminal behaviour.
 `intermediate_reward_scale=0.1` provides per-step shaping signal while keeping
 the terminal reward dominant.
 
+The **`commit` action** (index 3, *not* one of the 3 `HOTSPOT_MODES` — so the fixed-bandit
+baselines are unaffected) ends the episode early and takes the *unscaled* terminal reward
+from the current step; in live mode it fires the single per-episode oracle call at the commit
+step. Otherwise the episode times out after 10 steps. `step()` info carries
+`termination_reason` (`"commit"` / `"timeout"`). Note the commit action was built for
+formulation completeness — after the live-oracle fix (one oracle call per episode regardless),
+it no longer saves calls, and §3.1 found no within-episode value for it to exploit.
+
 ### Observation space
 
-At each step the policy receives a float32 vector of size `n_targets + 5`:
+At each step the policy receives a float32 vector of size `n_targets + 5 + len(HOTSPOT_MODES)`
+(= `n_targets + 8`):
 
 | Component | Description |
 |---|---|
-| Target one-hot | Which target this episode is for |
+| Target one-hot | Which target this episode is for (zeroed if `mask_target_onehot=True`, for ablations) |
 | `step_progress` | Steps completed / 10 |
 | `t_norm` | Current diffusion timestep / 1000 |
 | `length_delta_norm` | 0.0 or 1.0 (length delta drawn at reset) |
 | `best_iptm` | Running max ipTM seen so far this episode |
 | `best_neg_ipae` | Running max of (1 − pAE/30) seen so far this episode |
+| Action history (×3) | Per-hotspot-mode usage counts so far this episode, normalised by 10 |
 
 ### Policy network
 
@@ -79,7 +99,7 @@ A small MLP actor-critic (no pretrained weights, built fresh per experiment):
 Input (obs_dim)
   → Linear(obs_dim, 64) → Tanh
   → Linear(64, 64) → Tanh        [shared trunk]
-  ├→ Linear(64, 3)                [policy head: logits over hotspot modes]
+  ├→ Linear(64, n_actions)        [policy head: logits over 3 hotspot modes + commit]
   └→ Linear(64, 1)                [value head: PPO baseline]
 ```
 
@@ -107,8 +127,10 @@ Both backends implement the same interface:
 **Offline oracle** (`OfflineRewardModel`): samples a real logged record from
 `data/records.jsonl`. If the exact (target, timestep, hotspot_mode, length_delta) cell is
 empty, backs off through a documented hierarchy — drop length match → drop hotspot match →
-nearest timestep → target-global. Backoff level is logged per step. ~4,050 records,
-instant lookup (microseconds per step).
+nearest timestep → target-global. Backoff level is logged per step. ~4,075 records,
+instant lookup (microseconds per step). The 25-cell lever-grid fill (2026-07-07) removed
+most of the earlier backoff caveat (30 combined hotspot+length cells still lack a backing
+problem JSON — see `NEXT_STEPS.md` §1.3).
 
 **Live oracle** (`LiveRewardModel`): shells out to the Genie3 conda env, runs
 `trajectory_branching.py` then `eval.py`, parses `child_*_metrics.json`. ~10 min per call.
@@ -119,33 +141,50 @@ and LoRA fine-tuning.
 
 ### Reward function
 
-`compute_reward(metrics)` in `oracle/reward_oracle.py` — pure function, no I/O.
-The reward is arithmetic on numbers ColabFold already produced; it adds negligible compute.
+`compute_reward(metrics)` in `oracle/reward_oracle.py` — pure function, no I/O. As of
+2026-07-16 this is the **tiered** structure from `NEXT_STEPS.md` §2.2, not a flat weighted
+average:
 
 ```
-reward = Σ(weight_i × value_i) / Σ(weights_present)
+designable AND hotspot_coverage ≥ threshold:  reward = 1.0 + coverage×3.0 + iptm×1.0
+designable only:                              reward = 0.5 − (1 − coverage_or_0.5)/5.0
+not designable:                               reward = −complex_scrmsd / 10.0
 ```
 
-| Term | Weight | Computation | Status |
+`designable` reuses the existing `complex_success`/thresholded-iptm+ipae check. The nuance
+term uses normalized `iptm` as a stand-in for the design doc's `iptm_energy` (a free-energy
+quantity from pre-softmax PAE logits ColabFold doesn't expose through this pipeline yet —
+future work, not approximated further than this). Reward is no longer bounded to `[0,1]`:
+roughly `[-3, 5]`. Falls back to the old flat weighted average
+(`_legacy_weighted_average`) only when a metrics dict has no success-relevant signal at all
+(e.g. partial dicts). `diversity` is not part of the tiered formula (dropped per §2.2's spec,
+not carried forward as an extra term).
+
+| Term | Role | Computation | Status |
 |---|---|---|---|
-| `success` | 1.0 | 1.0 if ipTM≥0.80 AND pAE≤10.0, else 0.0 | active |
-| `interface_iptm` | 0.5 | ipTM clipped to [0, 1] | active |
-| `interface_ipae` | 0.5 | 1 − (pAE / 30) | active |
-| `hotspot_coverage` | 0.5 | fraction of specified hotspot residues contacted (5Å geometry) | **stubbed — always None** |
-| `diversity` | 0.1 | 1 − max sequence identity to siblings in same cell | active but noisy offline |
-| `ics` | 0.5 (planned) | avg predicted contact probability at interface contacts (Promera) | **not yet implemented** |
+| `complex_success` (designable) | tier gate | ipTM≥0.80 AND pAE≤10.0, or ColabFold's own success flags | active |
+| `hotspot_coverage` | tier gate + tier-1 scale | fraction of specified hotspot residues contacted (8Å Cβ geometry) | computed on live calls; being backfilled on existing offline records (grid re-fill job, 2026-07-16) |
+| `iptm` | tier-1 nuance (stand-in for `iptm_energy`) | ipTM clipped to [0, 1] | active |
+| `complex_scrmsd` | fail-tier scale | ColabFold scRMSD | active |
+| `ics` | not yet wired in | avg predicted contact probability at interface contacts (Promera-style) | implemented in `live_oracle.py`; still not a `compute_reward` term — same backfill blocker as hotspot_coverage |
 
-Terms whose inputs are `None` are dropped and the denominator renormalised. With
-`hotspot_coverage` always None, the effective reward is:
-`(1.0×success + 0.5×iptm + 0.5×(1−pAE/30)) / 2.0`
+**iCS** (`_compute_ics`) and **hotspot coverage** (`_compute_hotspot_coverage`) both landed
+in `oracle/live_oracle.py` (2026-07-07) and are validated live end-to-end. A live-oracle
+re-fill job (42 BHRF1/InsulinR lever cells, `experiments/fill_lever_grid.py --no-skip-existing`)
+was submitted 2026-07-16 to backfill both on existing offline records (the raw ColabFold PAE
+matrix wasn't saved when those cells first ran).
 
 ### Baselines
 
 Each experiment compares PPO against:
 - **Random**: uniform random hotspot mode each step
 - **Fixed-all / fixed-ablate / fixed-missed**: always picks the same mode for all 10 steps;
-  best of these three is the "optimal bandit" floor
-- **UCB bandit** (earlier one-shot experiments): upper-confidence-bound over the action space
+  best of these three is the "optimal single-action" floor
+- **Per-target contextual bandit** (`baselines/contextual_bandit.py`): UCB over the 3 hotspot
+  arms, conditioned on target identity, one constant arm replayed across the window. This is
+  **the** baseline that decides whether PPO earns its complexity — it *can* specialize per
+  target, which a single fixed action cannot. Wired into the windowed-MDP comparison
+  (`ppo_vs_bandit_offline.py`) 2026-07-12; PPO does not beat it (§3.1).
 
 ### Frontier buffer (Go-Explore, currently inactive)
 
@@ -155,22 +194,28 @@ can be seeded from this buffer rather than fresh noise, so Genie3 resumes from a
 known-good starting point (lightweight Go-Explore). Seeding experiment showed no
 improvement (−0.017 vs cold start); implemented but not currently load-bearing.
 
-### LoRA fine-tuning (separate experimental track)
+### LoRA fine-tuning (separate experimental track) — currently a misnomer, see NEXT_STEPS.md §8
 
-Attaches LoRA adapters (r=8, α=16) to Genie3's V1Denoiser IPA + LatentTransformer layers,
-then uses PPO to fine-tune those adapter weights — so the diffusion model itself learns to
-generate better binders rather than just selecting among pre-defined configurations.
-Requires live oracle. Current result: +0.167 pre→post, n=3 eval episodes (not reportable).
+Attaches LoRA adapters (r=8, α=16) to Genie3's V1Denoiser IPA + LatentTransformer layers, but
+**`train_lora_ppo` never actually trains them** (found 2026-07-16) — its optimizer only
+touches the small lever-selection MLP; the diffusion model's gradients are structurally
+blocked (subprocess generation, plus `torch.inference_mode()` in genie3's sampler). The
+existing n=3 result (+0.167 pre→post) reflects the already-known lever-selection-transfer
+result, not diffusion-model adaptation. A real fix (DDPO-style policy gradients through the
+sampler's per-step Gaussian — confirmed feasible against genie3's actual code, genie3's
+`DDIMSampler` is stochastic with `eta=1.0` by default) is scoped in `NEXT_STEPS.md` §8 but not
+implemented — multi-day effort, needs its own session.
 
 ### What is not yet load-bearing
 
-| Component | Blocker |
+| Component | Status / blocker |
 |---|---|
-| Real iCS metric | Needs raw ColabFold PAE matrices; no code in `oracle/` yet |
-| Hotspot coverage | Needs PDB geometry check post-ColabFold; stubbed as None |
-| PPO beating fixed in windowed MDP | Offline data too sparse for non-`all` modes (~40% backoff) |
-| LoRA result | Needs SLURM re-run with n≥10 eval episodes |
-| Window-start validation | Preliminary; re-run after lever grid is filled |
+| iCS as a reward term | `_compute_ics` implemented & live-validated; not yet in `compute_reward`; grid re-fill job (2026-07-16, job 55986875) backfilling it on offline records |
+| Hotspot coverage in reward | Now gates the tiered `compute_reward` (2026-07-16); still `None` on offline records not yet covered by the grid re-fill job |
+| PPO beating the contextual bandit | Does not, on the windowed MDP (§3.1) — believed to be a genuine finding (contextual-bandit-shaped problem), not a data-sparsity artifact |
+| LoRA result | Not just "needs a re-run" — `train_lora_ppo` doesn't train the LoRA adapter at all (found 2026-07-16, `NEXT_STEPS.md` §8). Held off pending either a relabeled actor_critic-only run or the real DDPO-style fix |
+| FK-Steering live phase | Offline best-of-k cut built (`fk_steering.py`); true mid-trajectory kill/duplicate needs genie3 partial-state cloning + a usable intermediate potential (§7.1 found the cheap geometric ones too weak) |
+| Structural policy encoder / generalization | Flat MLP can't transfer to unseen targets; §5 redesign not started |
 
 ---
 
@@ -180,16 +225,20 @@ Summary of key findings:
 
 | Finding | Evidence |
 |---|---|
-| PPO learns better timestep selection than a bandit | Stage 1: +0.036, 3 seeds consistent |
-| Adding length + hotspot levers amplifies PPO's advantage | Stage 2: +0.132 vs bandit |
+| PPO learns better timestep selection than a bandit (one-shot env) | Stage 1: +0.036, 3 seeds consistent |
+| Adding length + hotspot levers amplifies PPO's advantage (one-shot) | Stage 2: +0.132 vs bandit |
 | Warm-starting the bandit doesn't close the gap | Stages 1b, 2b: PPO still wins |
 | PPO finds qualitatively different strategies per target | Stage 3: InsulinR → `ablate_competitors` at t=900; bandit missed this |
 | Direction scale is not a useful lever | Intervention policy: +0.003 over fixed |
 | Offline training generalises to live oracle | Live validation: BHRF1 +0.155 above offline mean |
-| Sparse terminal reward fails in the 10-step windowed MDP | Windowed PPO: training curve flat, PPO −0.013 vs fixed |
-| Intermediate reward shaping unblocks the signal | Training curve lifts from 0.000 to ~0.04–0.05 |
-| Offline data sparsity is now the binding constraint | PPO still −0.015 vs fixed at 2000 episodes with shaping |
-| window_start=850 gives best PPO mean reward in placement sweep | Window sweep: best fixed-baseline outcomes at 800–850 |
+| ~~Sparse terminal reward fails in the windowed MDP~~ **was a training-loop bug** | The training curve "flat at 0.000" was a loop that only ever stepped `step_count==0` and never reached the terminal reward; fixed 2026-07-06 (`NEXT_STEPS.md` §0.1) |
+| After the fix, PPO beats fixed+random in `ppo_vs_bandit_offline` | 0.593 vs 0.579 (best fixed) vs 0.575 (random) — but this margin is cross-target specialization only |
+| The windowed-MDP "win" is entirely cross-target specialization | `target_onehot_ablation`: Δ vs fixed flips +0.010 → −0.034 when the target one-hot is masked |
+| Single-target PPO loses to a constant action at 11/12 configs | `window_start_ablation` (10 placements + 2 natural windows) |
+| **PPO does not beat the per-target contextual bandit** | `ppo_vs_bandit_offline` (2026-07-12): Δ = −0.015, inside the ±0.024 noise floor; PPO's only real margin is +0.10 over random |
+| Cheap geometric FK potentials (rg, nc_termini) too weak to steer on | `fk_correlation_test`: overall Pearson −0.23 (rg), +0.00 (nc_termini), n=125 |
+| Branch-point `x_T` summaries barely predict terminal reward | `xt_state_probe`: Spearman ≈ 0.14–0.19, n=25 — soft no-go for richer within-episode state |
+| Measurement noise floor for identical configs is ±0.024 | 5-seed sweep (§6); clip ε=0.1 the only consistently-positive cheap fix (+0.011) |
 
 ---
 
@@ -199,11 +248,13 @@ Summary of key findings:
 config.py                          paths + action-space constants
 instrumentation/                   offline ingester + trajectory logger
 oracle/reward_oracle.py            compute_reward() + OfflineRewardModel
-oracle/live_oracle.py              LiveRewardModel: Genie3 → ProteinMPNN → ColabFold
+oracle/live_oracle.py              LiveRewardModel + iCS / hotspot-coverage / property metrics
+oracle/branching_wrapper.py        genie3 trajectory_branching + eval.py bridge
 envs/genie_branch_env.py           one-shot lever-selection env (Stages 1–3)
-envs/commitment_window.py          commitment window detector + windowed MDP
-baselines/                         fixed, random, UCB bandit
-policy/lora_finetune.py            actor-critic MLP + PPO loop + LoRA attach
+envs/commitment_window.py          commitment window detector + windowed MDP (Discrete(4), commit)
+baselines/                         fixed_heuristic, random_policy, contextual_bandit (UCB, per-target)
+policy/lora_finetune.py            actor-critic MLP + PPO loop + LoRA attach + GAE buffer
+policy/fk_steering.py              FK-Steering resample + rollout (offline best-of-k cut)
 buffer/frontier_buffer.py          x_T seed cache (Go-Explore style)
 experiments/
   compare_timestep_lever.py        Stage 1: PPO vs bandit, timestep only
@@ -213,22 +264,45 @@ experiments/
   benchmark_frontier_seeding.py    cold vs buffer-seeded rollout comparison
   train_intervention_policy.py     commitment window detection + intervention PPO
   finetune_genie3_lora.py          LoRA fine-tuning of V1Denoiser (GPU)
-  ppo_vs_bandit_offline.py         windowed MDP: PPO vs bandit with intermediate reward
+  ppo_vs_bandit_offline.py         windowed MDP: PPO vs contextual bandit + fixed + random
   window_start_sweep.py            sweep window_start boundary per guidance-interval paper
-tests/                             env shapes, compute_reward, bandit, ingest parsing
+  window_start_ablation.py         single-target rerun of the sweep (isolates specialization)
+  target_onehot_ablation.py        mask target one-hot → confirms cross-target specialization
+  fill_lever_grid.py               live-oracle lever-grid fill (multi-GPU)
+  fk_correlation_test.py           intermediate-reward correlation gate (§7.1)
+  fk_vs_ppo_offline.py             FK-Steering 2×2 comparison (§7.3)
+  xt_state_probe.py                branch-point x_T vs terminal-reward probe (§3.3)
+tests/                             env shapes, compute_reward, bandit, GAE, FK, ingest parsing
 ```
 
 ---
 
 ## Next steps
 
-1. **Fill lever grid** — run live oracle to fill ~8 missing (hotspot_mode × length_delta)
-   cells at branch_t=800 for BHRF1 and InsulinR; removes the ~40% backoff caveat
-2. **LoRA re-run** — 500 offline train + 10 pre/post live eval episodes on SLURM (m5016, 4h)
-3. **Add iCS** — implement `_compute_ics()` in `oracle/live_oracle.py`; recompute offline
-   records; add as reward term (see NEXT_STEPS.md §4 for the 6-step implementation plan)
-4. **Add hotspot coverage** — PDB geometry check in `_aggregate_children()`
-5. **Re-run windowed PPO + window sweep** after grid fill and iCS
+Done since the last README revision: lever grid filled (25/25 cells), iCS and hotspot
+coverage implemented and live-validated, commit action + action-history obs added, FK-Steering
+offline cut and the contextual-bandit windowed comparison wired in, full FK-vs-PPO offline 2×2
+run at N_TRAIN=500/N_EVAL=200 (`4=0.637 > 3=0.510 > 2=0.487 > 1=0.415` — search and policy are
+complementary, not redundant). As of 2026-07-16: reward reform implemented (tiered
+`compute_reward`), live-oracle grid re-fill submitted to backfill hotspot_coverage/iCS (job
+55986875), and the LoRA re-run held off after finding `train_lora_ppo` never actually trains
+the LoRA adapter (`NEXT_STEPS.md` §8). Remaining:
+
+1. **Merge the grid re-fill results** into `data/records.jsonl` once job 55986875 completes,
+   confirm hotspot_coverage/iCS are populated, re-check the tiered reward against real data
+2. **LoRA path decision** — either run `finetune_genie3_lora.py` as an honestly-relabeled
+   actor_critic-transfers-to-live-oracle check (n≥10), or implement the real DDPO-style fix
+   scoped in `NEXT_STEPS.md` §8 (multi-day effort: sampler training-path variant, diffusion
+   log-prob, trajectory storage, new training loop)
+3. **FK-Steering live phase** — mid-trajectory kill/duplicate needs genie3 partial-state cloning
+   and a usable intermediate potential (the cheap geometric ones failed the §7.1 gate)
+4. **Structural policy encoder** — the §5 redesign, the only path to generalizing beyond the
+   current memorized targets
+5. **Contact-geometry reward terms** (`iptm_energy` proper, `i_con`) — the tiered reward
+   currently stands in `iptm` for `iptm_energy`; a real free-energy term needs raw pre-softmax
+   PAE logits ColabFold doesn't expose through this pipeline yet
+
+The detailed, cross-checked design log lives in [`NEXT_STEPS.md`](NEXT_STEPS.md).
 
 ---
 
@@ -265,8 +339,8 @@ python -m experiments.validate_live_oracle
 python -m experiments.benchmark_frontier_seeding
 python -m experiments.finetune_genie3_lora
 
-# SLURM (4h, m5016):
-sbatch --account=m5016 --time=04:00:00 --nodes=1 --gpus=1 \
+# SLURM (4h, m4351):
+sbatch --account=m4351 --time=04:00:00 --nodes=1 --gpus=1 \
        --constraint=gpu --qos=regular \
        --wrap="conda run -n genie3 python -m experiments.finetune_genie3_lora"
 ```
